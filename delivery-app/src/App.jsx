@@ -1,0 +1,711 @@
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
+
+// ═══════════════════════════════════════════════════════════════════
+// ALGORITHM — JS port faithful to the Python implementation
+// ═══════════════════════════════════════════════════════════════════
+
+function haversineKm(a, b) {
+  const R = 6371.0;
+  const toRad = (d) => (d * Math.PI) / 180;
+  const dLat = toRad(b.lat - a.lat);
+  const dLon = toRad(b.lng - a.lng);
+  const h =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(a.lat)) * Math.cos(toRad(b.lat)) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+
+function travelMin(a, b, cfg) {
+  return ((haversineKm(a, b) * cfg.detourFactor) / cfg.avgSpeedKmh) * 60;
+}
+
+function calcTripTimes(trip, pizzeria, cfg) {
+  const ds = trip.deliveries;
+  if (!ds.length) return trip;
+  const relArrivals = [];
+  let pos = pizzeria, t = 0;
+  for (const d of ds) {
+    t += travelMin(pos, d, cfg);
+    relArrivals.push(t);
+    t += cfg.stopTimeMin;
+    pos = d;
+  }
+  const latestDeps = ds.map((d, i) => d.slot - relArrivals[i]);
+  trip.departureTime = Math.min(...latestDeps);
+  // Departure floor: rider cannot leave before slot - earlyToleranceMin (pizzas not ready)
+  const departureFloor = ds[0].slot - cfg.earlyToleranceMin;
+  trip.departureTime = Math.max(trip.departureTime, departureFloor);
+  trip.totalTime = relArrivals[relArrivals.length - 1] + cfg.stopTimeMin;
+  const returnTravel = travelMin(ds[ds.length - 1], pizzeria, cfg);
+  trip.returnTime = trip.totalTime + returnTravel;
+  trip.arrivalTimes = relArrivals.map((r) => trip.departureTime + r);
+  trip.totalPizzas = ds.reduce((s, d) => s + d.numPizzas, 0);
+  return trip;
+}
+
+function isTripValid(trip, pizzeria, cfg) {
+  if (!trip.deliveries.length) return true;
+  if (trip.totalPizzas > cfg.pizzeCapacity) return false;
+  if (trip.totalTime > cfg.tMaxMin) return false;
+  // Departure floor: rider cannot leave before slot - earlyToleranceMin
+  if (trip.departureTime < trip.deliveries[0].slot - cfg.earlyToleranceMin) return false;
+  let pos = pizzeria, t = trip.departureTime;
+  for (const d of trip.deliveries) {
+    t += travelMin(pos, d, cfg);
+    if (t > d.slot + cfg.lateToleranceMin) return false;
+    t += cfg.stopTimeMin;
+    pos = d;
+  }
+  return true;
+}
+
+function tripReturnTime(trip) {
+  return trip.departureTime + trip.returnTime;
+}
+
+function hasTimelineConflict(riderTrips, candidate, originalIdx) {
+  const cStart = candidate.departureTime;
+  const cEnd = tripReturnTime(candidate);
+  for (let i = 0; i < riderTrips.length; i++) {
+    if (i === originalIdx) continue;
+    const g = riderTrips[i];
+    if (cStart < tripReturnTime(g) && g.departureTime < cEnd) return true;
+  }
+  return false;
+}
+
+function deepCloneTrip(trip) {
+  return {
+    ...trip,
+    deliveries: trip.deliveries.map((d) => ({ ...d })),
+    arrivalTimes: trip.arrivalTimes ? [...trip.arrivalTimes] : [],
+  };
+}
+
+function cheapestInsertion(trip, newDel, pizzeria, cfg) {
+  const candidates = [];
+  for (let i = 0; i <= trip.deliveries.length; i++) {
+    const g = deepCloneTrip(trip);
+    g.deliveries.splice(i, 0, { ...newDel });
+    calcTripTimes(g, pizzeria, cfg);
+    if (isTripValid(g, pizzeria, cfg)) candidates.push(g);
+  }
+  candidates.sort((a, b) => a.totalTime - b.totalTime);
+  return candidates;
+}
+
+function calcAvailableSlots(slots, newCoord, numPizzas, orderId, riders, pizzeria, cfg) {
+  if (numPizzas > cfg.pizzeCapacity) return [];
+  const results = [];
+  for (const slot of slots) {
+    const newDel = { id: orderId, lat: newCoord.lat, lng: newCoord.lng, numPizzas, slot };
+    let bestOption = null, bestCost = Infinity;
+    for (let ri = 0; ri < riders.length; ri++) {
+      const rider = riders[ri];
+      // Option A: insert into existing trip
+      for (let ti = 0; ti < rider.trips.length; ti++) {
+        const trip = rider.trips[ti];
+        if (trip.totalPizzas + numPizzas > cfg.pizzeCapacity) continue;
+        // Single-slot trips: only insert into trips with matching slot
+        if (trip.deliveries.length > 0 && trip.deliveries[0].slot !== newDel.slot) continue;
+        const candidates = cheapestInsertion(trip, newDel, pizzeria, cfg);
+        for (const cand of candidates) {
+          if (hasTimelineConflict(rider.trips, cand, ti)) continue;
+          const cost = (cand.returnTime - trip.returnTime) * 60;
+          if (cost < bestCost) {
+            bestCost = cost;
+            bestOption = { slot, riderId: ri, type: "inserimento", cost, trip: cand, origTripIdx: ti };
+          }
+          break;
+        }
+      }
+      // Option B: new trip
+      const newTrip = { deliveries: [{ ...newDel }], totalPizzas: numPizzas };
+      calcTripTimes(newTrip, pizzeria, cfg);
+      if (isTripValid(newTrip, pizzeria, cfg) && !hasTimelineConflict(rider.trips, newTrip, -1)) {
+        const cost = newTrip.returnTime * 60 * cfg.newTripPenalty;
+        if (cost < bestCost) {
+          bestCost = cost;
+          bestOption = { slot, riderId: ri, type: "nuovo_giro", cost, trip: newTrip, origTripIdx: -1 };
+        }
+      }
+    }
+    if (bestOption) results.push(bestOption);
+  }
+  return results;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// CONSTANTS & HELPERS
+// ═══════════════════════════════════════════════════════════════════
+
+const RIDER_COLORS = ["#ef4444", "#3b82f6", "#22c55e", "#f59e0b", "#a855f7", "#ec4899"];
+const PIZZERIA_DEFAULT = { lat: 45.428978, lng: 12.077287 };
+
+const DEFAULT_CFG = {
+  numRiders: 2, pizzeCapacity: 12, tMaxMin: 30, earlyToleranceMin: 5, lateToleranceMin: 10,
+  detourFactor: 1.3, avgSpeedKmh: 25, stopTimeMin: 3, newTripPenalty: 1.5,
+};
+
+const timeStr = (min) => {
+  const h = Math.floor(min / 60);
+  const m = Math.round(min % 60);
+  return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
+};
+
+const genSlots = (startH, startM, endH, endM, interval) => {
+  const slots = [];
+  let t = startH * 60 + startM;
+  const end = endH * 60 + endM;
+  while (t <= end) { slots.push(t); t += interval; }
+  return slots;
+};
+
+let _idCounter = 0;
+const nextId = () => `ord-${++_idCounter}`;
+
+const PRESET_ORDERS = [
+  { lat: 45.4180, lng: 11.8810, numPizzas: 3, slot: 18 * 60 + 30, label: "Arcella" },
+  { lat: 45.4100, lng: 11.8950, numPizzas: 2, slot: 18 * 60 + 30, label: "Stanga" },
+  { lat: 45.3950, lng: 11.9050, numPizzas: 4, slot: 19 * 60, label: "Forcellini" },
+  { lat: 45.4050, lng: 11.8600, numPizzas: 2, slot: 19 * 60, label: "Mandria" },
+  { lat: 45.4150, lng: 11.8650, numPizzas: 3, slot: 19 * 60, label: "Sacra Famiglia" },
+];
+
+// ═══════════════════════════════════════════════════════════════════
+// MAIN APP
+// ═══════════════════════════════════════════════════════════════════
+
+export default function App() {
+  const [cfg, setCfg] = useState(DEFAULT_CFG);
+  const [pizzeria] = useState(PIZZERIA_DEFAULT);
+  const [slots] = useState(() => genSlots(18, 0, 21, 0, 15));
+  const [riders, setRiders] = useState(() =>
+    Array.from({ length: DEFAULT_CFG.numRiders }, (_, i) => ({ id: i, trips: [] }))
+  );
+  const [mapReady, setMapReady] = useState(false);
+  const [newOrderPos, setNewOrderPos] = useState(null);
+  const [newOrderPizzas, setNewOrderPizzas] = useState(2);
+  const [availableSlots, setAvailableSlots] = useState(null);
+  const [previewSlot, setPreviewSlot] = useState(null);
+  const [selectedTripKey, setSelectedTripKey] = useState(null);
+  const [showConfig, setShowConfig] = useState(false);
+  const [mode, setMode] = useState("view"); // view | placing | selecting
+
+  const mapRef = useRef(null);
+  const mapInst = useRef(null);
+  const layersRef = useRef({ markers: null, routes: null, preview: null, newMarker: null, pizzeriaMarker: null });
+
+  // ── Leaflet loading ──
+  useEffect(() => {
+    if (window.L) { setMapReady(true); return; }
+    const link = document.createElement("link");
+    link.rel = "stylesheet";
+    link.href = "https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css";
+    document.head.appendChild(link);
+    const script = document.createElement("script");
+    script.src = "https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js";
+    script.onload = () => setMapReady(true);
+    document.head.appendChild(script);
+  }, []);
+
+  // ── Map init ──
+  useEffect(() => {
+    if (!mapReady || !mapRef.current || mapInst.current) return;
+    const L = window.L;
+    const map = L.map(mapRef.current, { zoomControl: false }).setView([pizzeria.lat, pizzeria.lng], 14);
+    L.control.zoom({ position: "bottomright" }).addTo(map);
+    L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", {
+      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a> &copy; <a href="https://carto.com/">CARTO</a>',
+      maxZoom: 19,
+    }).addTo(map);
+    layersRef.current.markers = L.layerGroup().addTo(map);
+    layersRef.current.routes = L.layerGroup().addTo(map);
+    layersRef.current.preview = L.layerGroup().addTo(map);
+
+    const pizzaIcon = L.divIcon({
+      html: `<div style="background:#fff;border-radius:50%;width:28px;height:28px;display:flex;align-items:center;justify-content:center;font-size:16px;box-shadow:0 2px 8px rgba(0,0,0,.4);">🍕</div>`,
+      iconSize: [28, 28], iconAnchor: [14, 14], className: "",
+    });
+    layersRef.current.pizzeriaMarker = L.marker([pizzeria.lat, pizzeria.lng], { icon: pizzaIcon })
+      .bindTooltip("Pizzeria", {
+        permanent: true, direction: "top", offset: [0, -16],
+        className: "pizzeria-tooltip"
+      })
+      .addTo(map);
+
+    map.on("click", (e) => {
+      window._mapClick && window._mapClick(e.latlng);
+    });
+    mapInst.current = map;
+
+    setTimeout(() => map.invalidateSize(), 200);
+  }, [mapReady, pizzeria]);
+
+  // ── Map click handler ──
+  useEffect(() => {
+    window._mapClick = (latlng) => {
+      if (mode !== "placing") return;
+      setNewOrderPos({ lat: latlng.lat, lng: latlng.lng });
+    };
+    return () => { window._mapClick = null; };
+  }, [mode]);
+
+  // ── Draw new order marker ──
+  useEffect(() => {
+    if (!mapReady || !mapInst.current) return;
+    const L = window.L;
+    const pg = layersRef.current;
+    if (pg.newMarker) { mapInst.current.removeLayer(pg.newMarker); pg.newMarker = null; }
+    if (newOrderPos) {
+      const icon = L.divIcon({
+        html: `<div style="background:#fbbf24;border:3px solid #fff;border-radius:50%;width:20px;height:20px;box-shadow:0 0 12px #fbbf24;"></div>`,
+        iconSize: [20, 20], iconAnchor: [10, 10], className: "",
+      });
+      pg.newMarker = L.marker([newOrderPos.lat, newOrderPos.lng], { icon }).addTo(mapInst.current);
+    }
+  }, [newOrderPos, mapReady]);
+
+  // ── Draw riders trips on map ──
+  const drawMap = useCallback(() => {
+    if (!mapReady || !mapInst.current) return;
+    const L = window.L;
+    const { markers, routes, preview } = layersRef.current;
+    markers.clearLayers();
+    routes.clearLayers();
+    preview.clearLayers();
+
+    riders.forEach((rider, ri) => {
+      const color = RIDER_COLORS[ri % RIDER_COLORS.length];
+      rider.trips.forEach((trip, ti) => {
+        const tripKey = `${ri}-${ti}`;
+        const isSelected = selectedTripKey === tripKey;
+        const opacity = selectedTripKey ? (isSelected ? 1 : 0.25) : 0.8;
+
+        // Route polyline
+        const points = [
+          [pizzeria.lat, pizzeria.lng],
+          ...trip.deliveries.map((d) => [d.lat, d.lng]),
+          [pizzeria.lat, pizzeria.lng],
+        ];
+        const poly = L.polyline(points, {
+          color, weight: isSelected ? 5 : 3, opacity,
+          dashArray: isSelected ? null : "8 4",
+        }).addTo(routes);
+        poly.on("click", () => setSelectedTripKey(isSelected ? null : tripKey));
+
+        // Delivery markers
+        trip.deliveries.forEach((d, di) => {
+          const icon = L.divIcon({
+            html: `<div style="
+              background:${color};border:2px solid #fff;border-radius:50%;
+              width:24px;height:24px;display:flex;align-items:center;justify-content:center;
+              font-size:11px;font-weight:700;color:#fff;opacity:${opacity};
+              box-shadow:0 2px 6px ${color}80;
+            ">${di + 1}</div>`,
+            iconSize: [24, 24], iconAnchor: [12, 12], className: "",
+          });
+          const arrTime = trip.arrivalTimes ? timeStr(trip.arrivalTimes[di]) : "?";
+          L.marker([d.lat, d.lng], { icon })
+            .bindTooltip(`${d.id} · ${d.numPizzas}🍕 · arrivo ${arrTime}`, { direction: "top", offset: [0, -14] })
+            .addTo(markers);
+        });
+      });
+    });
+
+    // Preview
+    if (previewSlot) {
+      const trip = previewSlot.trip;
+      const rColor = RIDER_COLORS[previewSlot.riderId % RIDER_COLORS.length];
+      const pts = [
+        [pizzeria.lat, pizzeria.lng],
+        ...trip.deliveries.map((d) => [d.lat, d.lng]),
+        [pizzeria.lat, pizzeria.lng],
+      ];
+      L.polyline(pts, { color: "#fbbf24", weight: 4, opacity: 0.9, dashArray: "6 6" }).addTo(preview);
+    }
+  }, [riders, pizzeria, selectedTripKey, previewSlot, mapReady]);
+
+  useEffect(() => { drawMap(); }, [drawMap]);
+
+  // ── Actions ──
+  const loadPreset = () => {
+    _idCounter = 0;
+    const newRiders = Array.from({ length: cfg.numRiders }, (_, i) => ({ id: i, trips: [] }));
+    // Assign preset orders using the algorithm itself, one by one
+    for (const po of PRESET_ORDERS) {
+      const id = nextId();
+      const res = calcAvailableSlots(
+        [po.slot], { lat: po.lat, lng: po.lng }, po.numPizzas, id, newRiders, pizzeria, cfg
+      );
+      if (res.length > 0) {
+        const best = res[0];
+        const rider = newRiders[best.riderId];
+        if (best.type === "inserimento") {
+          rider.trips[best.origTripIdx] = best.trip;
+        } else {
+          rider.trips.push(best.trip);
+        }
+      }
+    }
+    setRiders(newRiders);
+    setAvailableSlots(null);
+    setPreviewSlot(null);
+    setSelectedTripKey(null);
+    setMode("view");
+    setNewOrderPos(null);
+  };
+
+  const startNewOrder = () => {
+    setMode("placing");
+    setAvailableSlots(null);
+    setPreviewSlot(null);
+    setSelectedTripKey(null);
+  };
+
+  const findSlots = () => {
+    if (!newOrderPos) return;
+    const id = nextId();
+    const res = calcAvailableSlots(slots, newOrderPos, newOrderPizzas, id, riders, pizzeria, cfg);
+    setAvailableSlots(res);
+    setMode("selecting");
+  };
+
+  const confirmSlot = (slotResult) => {
+    const newRiders = riders.map((r) => ({ ...r, trips: r.trips.map((t) => deepCloneTrip(t)) }));
+    const rider = newRiders[slotResult.riderId];
+    if (slotResult.type === "inserimento") {
+      rider.trips[slotResult.origTripIdx] = slotResult.trip;
+    } else {
+      rider.trips.push(slotResult.trip);
+    }
+    setRiders(newRiders);
+    setAvailableSlots(null);
+    setPreviewSlot(null);
+    setNewOrderPos(null);
+    setMode("view");
+  };
+
+  const cancelOrder = () => {
+    setMode("view");
+    setNewOrderPos(null);
+    setAvailableSlots(null);
+    setPreviewSlot(null);
+  };
+
+  const resetAll = () => {
+    _idCounter = 0;
+    setRiders(Array.from({ length: cfg.numRiders }, (_, i) => ({ id: i, trips: [] })));
+    setAvailableSlots(null);
+    setPreviewSlot(null);
+    setSelectedTripKey(null);
+    setNewOrderPos(null);
+    setMode("view");
+  };
+
+  // ── Timeline data ──
+  const timeRange = useMemo(() => {
+    let min = slots[0], max = slots[slots.length - 1];
+    riders.forEach((r) => r.trips.forEach((t) => {
+      if (t.departureTime < min) min = t.departureTime;
+      const ret = tripReturnTime(t);
+      if (ret > max) max = ret;
+    }));
+    return { min: min - 10, max: max + 10 };
+  }, [riders, slots]);
+
+  // ── Render ──
+  return (
+    <div style={{ height: "100vh", display: "flex", flexDirection: "column", background: "#0f172a", color: "#e2e8f0", fontFamily: "'JetBrains Mono', 'Fira Code', 'SF Mono', monospace", fontSize: 13 }}>
+
+      {/* ── HEADER ── */}
+      <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 16px", background: "#1e293b", borderBottom: "1px solid #334155", flexShrink: 0, flexWrap: "wrap" }}>
+        <span style={{ fontSize: 18, marginRight: 8 }}>🍕</span>
+        <span style={{ fontWeight: 700, fontSize: 15, letterSpacing: 1 }}>DELIVERY PLANNER</span>
+        <div style={{ flex: 1 }} />
+        <button onClick={loadPreset} style={btnStyle("#6366f1")}>Carica preset Padova</button>
+        <button onClick={startNewOrder} disabled={mode !== "view"} style={btnStyle("#22c55e", mode !== "view")}>+ Nuovo ordine</button>
+        <button onClick={resetAll} style={btnStyle("#64748b")}>Reset</button>
+        <button onClick={() => setShowConfig(!showConfig)} style={btnStyle("#475569")}>
+          {showConfig ? "Chiudi config" : "⚙ Config"}
+        </button>
+      </div>
+
+      {/* ── CONFIG PANEL ── */}
+      {showConfig && (
+        <div style={{ padding: "12px 16px", background: "#1e293b", borderBottom: "1px solid #334155", display: "flex", flexWrap: "wrap", gap: "12px 24px", alignItems: "center" }}>
+          {[
+            ["Fattorini", "numRiders", 1, 10, 1],
+            ["Capacità pizze", "pizzeCapacity", 1, 20, 1],
+            ["T max (min)", "tMaxMin", 10, 60, 5],
+            ["Min partenza pre-slot (min)", "earlyToleranceMin", 0, 30, 1],
+            ["Ritardo max (min)", "lateToleranceMin", 0, 30, 1],
+            ["Detour factor", "detourFactor", 1.0, 2.0, 0.1],
+            ["Velocità (km/h)", "avgSpeedKmh", 10, 50, 5],
+            ["Sosta (min)", "stopTimeMin", 1, 10, 1],
+            ["Penalità nuovo giro", "newTripPenalty", 1.0, 3.0, 0.1],
+          ].map(([label, key, min, max, step]) => (
+            <label key={key} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12 }}>
+              <span style={{ color: "#94a3b8" }}>{label}</span>
+              <input type="number" value={cfg[key]} min={min} max={max} step={step}
+                onChange={(e) => setCfg((c) => ({ ...c, [key]: parseFloat(e.target.value) || 0 }))}
+                style={{ width: 60, background: "#0f172a", border: "1px solid #475569", borderRadius: 4, padding: "3px 6px", color: "#e2e8f0", fontSize: 12 }}
+              />
+            </label>
+          ))}
+        </div>
+      )}
+
+      {/* ── MAIN AREA ── */}
+      <div style={{ flex: 1, display: "flex", minHeight: 0 }}>
+
+        {/* ── MAP ── */}
+        <div style={{ flex: 1, position: "relative", minHeight: 0 }}>
+          <div ref={mapRef} style={{ width: "100%", height: "100%" }} />
+
+          {/* Placing mode overlay */}
+          {mode === "placing" && (
+            <div style={{ position: "absolute", top: 12, left: "50%", transform: "translateX(-50%)", zIndex: 1000, background: "#fbbf24", color: "#0f172a", padding: "8px 20px", borderRadius: 8, fontWeight: 700, fontSize: 13, boxShadow: "0 4px 20px rgba(251,191,36,.4)" }}>
+              📍 Clicca sulla mappa per posizionare la consegna
+            </div>
+          )}
+
+          {!mapReady && (
+            <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", background: "#0f172a", zIndex: 1000 }}>
+              <span style={{ fontSize: 16 }}>Caricamento mappa...</span>
+            </div>
+          )}
+        </div>
+
+        {/* ── SIDE PANEL ── */}
+        <div style={{ width: 320, background: "#1e293b", borderLeft: "1px solid #334155", display: "flex", flexDirection: "column", overflowY: "auto", flexShrink: 0 }}>
+
+          {mode === "view" && !availableSlots && (
+            <div style={{ padding: 20 }}>
+              <h3 style={{ margin: "0 0 12px", fontSize: 14, color: "#94a3b8", fontWeight: 600, letterSpacing: 1, textTransform: "uppercase" }}>Stato fattorini</h3>
+              {riders.map((r, ri) => (
+                <div key={ri} style={{ marginBottom: 16 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+                    <div style={{ width: 12, height: 12, borderRadius: "50%", background: RIDER_COLORS[ri] }} />
+                    <span style={{ fontWeight: 600 }}>Fattorino #{ri + 1}</span>
+                    <span style={{ color: "#64748b", fontSize: 11 }}>{r.trips.length} giri</span>
+                  </div>
+                  {r.trips.length === 0 && <div style={{ color: "#475569", fontSize: 11, paddingLeft: 20 }}>Nessun giro</div>}
+                  {r.trips.map((trip, ti) => (
+                    <div key={ti}
+                      onClick={() => setSelectedTripKey(selectedTripKey === `${ri}-${ti}` ? null : `${ri}-${ti}`)}
+                      style={{
+                        padding: "6px 8px", marginLeft: 20, marginBottom: 4, borderRadius: 6, cursor: "pointer", fontSize: 11,
+                        background: selectedTripKey === `${ri}-${ti}` ? RIDER_COLORS[ri] + "30" : "#0f172a",
+                        border: `1px solid ${selectedTripKey === `${ri}-${ti}` ? RIDER_COLORS[ri] : "#334155"}`,
+                      }}>
+                      <div style={{ fontWeight: 600 }}>
+                        {timeStr(trip.departureTime)} → {timeStr(tripReturnTime(trip))}
+                        <span style={{ color: "#94a3b8", fontWeight: 400 }}> · {trip.totalPizzas}🍕 · {trip.deliveries.length} cons.</span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ))}
+            </div>
+          )}
+
+          {(mode === "placing" || mode === "selecting") && (
+            <div style={{ padding: 20 }}>
+              <h3 style={{ margin: "0 0 12px", fontSize: 14, color: "#fbbf24", fontWeight: 600 }}>Nuovo ordine</h3>
+
+              {newOrderPos ? (
+                <div style={{ fontSize: 11, color: "#94a3b8", marginBottom: 12 }}>
+                  📍 {newOrderPos.lat.toFixed(4)}, {newOrderPos.lng.toFixed(4)}
+                </div>
+              ) : (
+                <div style={{ fontSize: 11, color: "#64748b", marginBottom: 12 }}>Clicca sulla mappa...</div>
+              )}
+
+              <label style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 16 }}>
+                <span style={{ color: "#94a3b8", fontSize: 12 }}>Pizze:</span>
+                <input type="number" value={newOrderPizzas} min={1} max={cfg.pizzeCapacity}
+                  onChange={(e) => setNewOrderPizzas(Math.max(1, parseInt(e.target.value) || 1))}
+                  style={{ width: 60, background: "#0f172a", border: "1px solid #475569", borderRadius: 4, padding: "4px 8px", color: "#e2e8f0", fontSize: 13 }}
+                />
+              </label>
+
+              <div style={{ display: "flex", gap: 8 }}>
+                <button onClick={findSlots} disabled={!newOrderPos}
+                  style={btnStyle("#22c55e", !newOrderPos)}>
+                  Calcola slot
+                </button>
+                <button onClick={cancelOrder} style={btnStyle("#64748b")}>Annulla</button>
+              </div>
+
+              {/* Available slots */}
+              {availableSlots && (
+                <div style={{ marginTop: 20 }}>
+                  <h4 style={{ margin: "0 0 8px", fontSize: 12, color: "#94a3b8", textTransform: "uppercase", letterSpacing: 1 }}>
+                    Slot disponibili ({availableSlots.length})
+                  </h4>
+                  {availableSlots.length === 0 && (
+                    <div style={{ color: "#ef4444", fontSize: 12 }}>Nessuno slot disponibile</div>
+                  )}
+                  <div style={{ maxHeight: 400, overflowY: "auto" }}>
+                    {availableSlots.map((sr, i) => {
+                      const isHover = previewSlot === sr;
+                      const rColor = RIDER_COLORS[sr.riderId % RIDER_COLORS.length];
+                      return (
+                        <div key={i}
+                          onMouseEnter={() => setPreviewSlot(sr)}
+                          onMouseLeave={() => setPreviewSlot(null)}
+                          onClick={() => confirmSlot(sr)}
+                          style={{
+                            padding: "8px 10px", marginBottom: 4, borderRadius: 6, cursor: "pointer",
+                            background: isHover ? rColor + "25" : "#0f172a",
+                            border: `1px solid ${isHover ? rColor : "#334155"}`,
+                            transition: "all .15s",
+                          }}>
+                          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                            <span style={{ fontWeight: 700, fontSize: 14 }}>{timeStr(sr.slot)}</span>
+                            <span style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                              <div style={{ width: 8, height: 8, borderRadius: "50%", background: rColor }} />
+                              <span style={{ fontSize: 11 }}>#{sr.riderId + 1}</span>
+                            </span>
+                          </div>
+                          <div style={{ fontSize: 10, color: "#94a3b8", marginTop: 2 }}>
+                            {sr.type === "inserimento" ? "Inserimento in giro esistente" : "Nuovo giro"}
+                            {" · "}{sr.trip.deliveries.length} cons. · costo {Math.round(sr.cost)}s
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* ── TIMELINE (Gantt) ── */}
+      <div style={{ height: 180, background: "#1e293b", borderTop: "1px solid #334155", flexShrink: 0, overflowX: "auto", overflowY: "hidden" }}>
+        <Timeline
+          riders={riders} slots={slots} timeRange={timeRange}
+          selectedTripKey={selectedTripKey} setSelectedTripKey={setSelectedTripKey}
+          previewSlot={previewSlot} cfg={cfg}
+        />
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// TIMELINE COMPONENT
+// ═══════════════════════════════════════════════════════════════════
+
+function Timeline({ riders, slots, timeRange, selectedTripKey, setSelectedTripKey, previewSlot, cfg }) {
+  const containerRef = useRef(null);
+  const [width, setWidth] = useState(900);
+  useEffect(() => {
+    if (!containerRef.current) return;
+    const ro = new ResizeObserver(([e]) => setWidth(e.contentRect.width));
+    ro.observe(containerRef.current);
+    return () => ro.disconnect();
+  }, []);
+
+  const PAD_L = 90, PAD_R = 20;
+  const LANE_H = 44;
+  const chartW = Math.max(width - PAD_L - PAD_R, 200);
+  const totalH = riders.length * LANE_H + 36;
+  const { min: tMin, max: tMax } = timeRange;
+  const tScale = (t) => PAD_L + ((t - tMin) / (tMax - tMin)) * chartW;
+
+  return (
+    <div ref={containerRef} style={{ width: "100%", height: "100%", minWidth: 600 }}>
+      <svg width={width} height={totalH} style={{ display: "block" }}>
+        {/* Time axis */}
+        {slots.map((s) => {
+          const x = tScale(s);
+          return (
+            <g key={s}>
+              <line x1={x} y1={0} x2={x} y2={totalH} stroke="#334155" strokeWidth={1} strokeDasharray="4 4" />
+              <text x={x} y={totalH - 4} textAnchor="middle" fill="#64748b" fontSize={10} fontFamily="monospace">{timeStr(s)}</text>
+            </g>
+          );
+        })}
+
+        {/* Rider lanes */}
+        {riders.map((rider, ri) => {
+          const y = ri * LANE_H + 8;
+          const color = RIDER_COLORS[ri % RIDER_COLORS.length];
+          return (
+            <g key={ri}>
+              {/* Lane background */}
+              <rect x={0} y={y} width={width} height={LANE_H - 4} rx={4} fill={ri % 2 === 0 ? "#0f172a40" : "transparent"} />
+              {/* Label */}
+              <text x={12} y={y + LANE_H / 2 - 2} dominantBaseline="middle" fill={color} fontSize={11} fontWeight="700" fontFamily="monospace">
+                Fattorino #{ri + 1}
+              </text>
+
+              {/* Trips */}
+              {rider.trips.map((trip, ti) => {
+                const tripKey = `${ri}-${ti}`;
+                const isSel = selectedTripKey === tripKey;
+                const x1 = tScale(trip.departureTime);
+                const x2 = tScale(tripReturnTime(trip));
+                const h = LANE_H - 14;
+                const ty = y + 5;
+                return (
+                  <g key={ti} style={{ cursor: "pointer" }} onClick={() => setSelectedTripKey(isSel ? null : tripKey)}>
+                    <rect x={x1} y={ty} width={Math.max(x2 - x1, 4)} height={h} rx={5}
+                      fill={color + (isSel ? "50" : "30")}
+                      stroke={isSel ? color : color + "80"} strokeWidth={isSel ? 2 : 1} />
+                    {/* Delivery dots */}
+                    {trip.arrivalTimes && trip.arrivalTimes.map((at, di) => {
+                      const dx = tScale(at);
+                      return (
+                        <g key={di}>
+                          <circle cx={dx} cy={ty + h / 2} r={5} fill={color} stroke="#fff" strokeWidth={1.5} />
+                          <text x={dx} y={ty + h / 2} textAnchor="middle" dominantBaseline="central" fill="#fff" fontSize={7} fontWeight="700">
+                            {di + 1}
+                          </text>
+                        </g>
+                      );
+                    })}
+                    {/* Pizza count */}
+                    <text x={x1 + 6} y={ty + 10} fill="#e2e8f0" fontSize={9} fontFamily="monospace">
+                      {trip.totalPizzas}🍕
+                    </text>
+                  </g>
+                );
+              })}
+
+              {/* Preview trip */}
+              {previewSlot && previewSlot.riderId === ri && (() => {
+                const trip = previewSlot.trip;
+                const px1 = tScale(trip.departureTime);
+                const px2 = tScale(tripReturnTime(trip));
+                const ph = LANE_H - 14;
+                const py = y + 5;
+                return (
+                  <rect x={px1} y={py} width={Math.max(px2 - px1, 4)} height={ph} rx={5}
+                    fill="#fbbf2430" stroke="#fbbf24" strokeWidth={2} strokeDasharray="4 3" />
+                );
+              })()}
+            </g>
+          );
+        })}
+      </svg>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// STYLES
+// ═══════════════════════════════════════════════════════════════════
+
+function btnStyle(bg, disabled = false) {
+  return {
+    padding: "6px 14px", borderRadius: 6, border: "none", cursor: disabled ? "not-allowed" : "pointer",
+    background: disabled ? "#334155" : bg, color: disabled ? "#64748b" : "#fff",
+    fontWeight: 600, fontSize: 12, fontFamily: "inherit", transition: "all .15s",
+    opacity: disabled ? 0.6 : 1,
+  };
+}
