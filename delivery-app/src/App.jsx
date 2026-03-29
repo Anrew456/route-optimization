@@ -43,16 +43,22 @@ function calcTripTimes(trip, pizzeria, cfg) {
   return trip;
 }
 
+function lateToleranceForDelivery(delivery, pizzeria, cfg) {
+  const distKm = haversineKm(pizzeria, delivery) * cfg.detourFactor;
+  const extra = cfg.distToleranceFactor * distKm;
+  return Math.min(cfg.lateToleranceMin + extra, cfg.tMaxMin);
+}
+
 function isTripValid(trip, pizzeria, cfg) {
   if (!trip.deliveries.length) return true;
   if (trip.totalPizzas > cfg.pizzeCapacity) return false;
-  if (trip.totalTime > cfg.tMaxMin) return false;
+  if (trip.deliveries.length > cfg.maxDeliveriesPerTrip) return false;
   // Departure floor: rider cannot leave before slot - earlyToleranceMin
   if (trip.departureTime < trip.deliveries[0].slot - cfg.earlyToleranceMin) return false;
   let pos = pizzeria, t = trip.departureTime;
   for (const d of trip.deliveries) {
     t += travelMin(pos, d, cfg);
-    if (t > d.slot + cfg.lateToleranceMin) return false;
+    if (t > d.slot + lateToleranceForDelivery(d, pizzeria, cfg)) return false;
     t += cfg.stopTimeMin;
     pos = d;
   }
@@ -94,44 +100,248 @@ function cheapestInsertion(trip, newDel, pizzeria, cfg) {
   return candidates;
 }
 
-function calcAvailableSlots(slots, newCoord, numPizzas, orderId, riders, pizzeria, cfg) {
-  if (numPizzas > cfg.pizzeCapacity) return [];
-  const results = [];
-  for (const slot of slots) {
-    const newDel = { id: orderId, lat: newCoord.lat, lng: newCoord.lng, numPizzas, slot };
+// ── Global re-optimization helpers ──
+
+function extractAllDeliveries(riders) {
+  const deliveries = [];
+  for (const rider of riders)
+    for (const trip of rider.trips)
+      for (const d of trip.deliveries)
+        deliveries.push({ ...d });
+  return deliveries;
+}
+
+function riderHasConflicts(trips) {
+  for (let i = 0; i < trips.length; i++)
+    for (let j = i + 1; j < trips.length; j++)
+      if (trips[i].departureTime < tripReturnTime(trips[j]) &&
+          trips[j].departureTime < tripReturnTime(trips[i]))
+        return true;
+  return false;
+}
+
+function totalReturnTimeAll(riders) {
+  let total = 0;
+  for (const r of riders) for (const t of r.trips) total += t.returnTime;
+  return total;
+}
+
+// Build all routes from scratch with smart seed ordering + cheapest insertion
+function rebuildAllRoutes(allDeliveries, numRiders, pizzeria, cfg) {
+  // Seed ordering: slot ascending, then farthest from pizzeria first
+  const sorted = [...allDeliveries].sort((a, b) => {
+    if (a.slot !== b.slot) return a.slot - b.slot;
+    return haversineKm(pizzeria, b) - haversineKm(pizzeria, a);
+  });
+
+  const riders = Array.from({ length: numRiders }, (_, i) => ({ id: i, trips: [] }));
+
+  for (const del of sorted) {
     let bestOption = null, bestCost = Infinity;
+
     for (let ri = 0; ri < riders.length; ri++) {
       const rider = riders[ri];
+
       // Option A: insert into existing trip
       for (let ti = 0; ti < rider.trips.length; ti++) {
         const trip = rider.trips[ti];
-        if (trip.totalPizzas + numPizzas > cfg.pizzeCapacity) continue;
-        // Single-slot trips: only insert into trips with matching slot
-        if (trip.deliveries.length > 0 && trip.deliveries[0].slot !== newDel.slot) continue;
-        const candidates = cheapestInsertion(trip, newDel, pizzeria, cfg);
+        if (trip.totalPizzas + del.numPizzas > cfg.pizzeCapacity) continue;
+        if (trip.deliveries.length >= cfg.maxDeliveriesPerTrip) continue;
+        if (trip.deliveries.length > 0 && trip.deliveries[0].slot !== del.slot) continue;
+
+        const candidates = cheapestInsertion(trip, del, pizzeria, cfg);
         for (const cand of candidates) {
           if (hasTimelineConflict(rider.trips, cand, ti)) continue;
+          // Check rider availability: temporarily substitute and verify
+          const origTrip = rider.trips[ti];
+          rider.trips[ti] = cand;
+          const availOk = countUnavailableRidersForSlot(riders, del.slot, cfg) < cfg.numRiders;
+          rider.trips[ti] = origTrip;
+          if (!availOk) continue;
           const cost = (cand.returnTime - trip.returnTime) * 60;
           if (cost < bestCost) {
             bestCost = cost;
-            bestOption = { slot, riderId: ri, type: "inserimento", cost, trip: cand, origTripIdx: ti };
+            bestOption = { riderId: ri, tripIdx: ti, trip: cand };
           }
           break;
         }
       }
-      // Option B: new trip
-      const newTrip = { deliveries: [{ ...newDel }], totalPizzas: numPizzas };
+
+      // Option B: new trip (small load-balancing tiebreaker)
+      const newTrip = { deliveries: [{ ...del }], totalPizzas: del.numPizzas };
       calcTripTimes(newTrip, pizzeria, cfg);
       if (isTripValid(newTrip, pizzeria, cfg) && !hasTimelineConflict(rider.trips, newTrip, -1)) {
-        const cost = newTrip.returnTime * 60 * cfg.newTripPenalty;
+        // Check rider availability: temporarily add and verify
+        rider.trips.push(newTrip);
+        const availOk = countUnavailableRidersForSlot(riders, del.slot, cfg) < cfg.numRiders;
+        rider.trips.pop();
+        if (!availOk) continue;
+        const cost = newTrip.returnTime * 60 * cfg.newTripPenalty + rider.trips.length * 0.001;
         if (cost < bestCost) {
           bestCost = cost;
-          bestOption = { slot, riderId: ri, type: "nuovo_giro", cost, trip: newTrip, origTripIdx: -1 };
+          bestOption = { riderId: ri, tripIdx: -1, trip: newTrip };
         }
       }
     }
-    if (bestOption) results.push(bestOption);
+
+    if (bestOption) {
+      const rider = riders[bestOption.riderId];
+      if (bestOption.tripIdx >= 0) {
+        rider.trips[bestOption.tripIdx] = bestOption.trip;
+      } else {
+        rider.trips.push(bestOption.trip);
+      }
+    }
   }
+
+  return riders;
+}
+
+// 2-opt: improve delivery order within a single trip
+function twoOpt(trip, pizzeria, cfg) {
+  const n = trip.deliveries.length;
+  if (n < 3) return trip;
+  let best = deepCloneTrip(trip);
+  let improved = true;
+  while (improved) {
+    improved = false;
+    for (let i = 0; i < n - 1; i++) {
+      for (let j = i + 2; j < n; j++) {
+        const cand = deepCloneTrip(best);
+        const rev = cand.deliveries.slice(i + 1, j + 1).reverse();
+        cand.deliveries.splice(i + 1, j - i, ...rev);
+        calcTripTimes(cand, pizzeria, cfg);
+        if (isTripValid(cand, pizzeria, cfg) && cand.returnTime < best.returnTime) {
+          best = cand;
+          improved = true;
+        }
+      }
+    }
+  }
+  return best;
+}
+
+function twoOptAll(riders, pizzeria, cfg) {
+  for (const rider of riders)
+    for (let ti = 0; ti < rider.trips.length; ti++)
+      rider.trips[ti] = twoOpt(rider.trips[ti], pizzeria, cfg);
+}
+
+// Or-opt: try moving each delivery to a better trip
+function orOpt(riders, pizzeria, cfg) {
+  let improved = true;
+  while (improved) {
+    improved = false;
+    for (let sri = 0; sri < riders.length && !improved; sri++) {
+      for (let sti = 0; sti < riders[sri].trips.length && !improved; sti++) {
+        const srcTrip = riders[sri].trips[sti];
+        for (let di = 0; di < srcTrip.deliveries.length && !improved; di++) {
+          const delivery = srcTrip.deliveries[di];
+
+          for (let dri = 0; dri < riders.length && !improved; dri++) {
+            for (let dti = 0; dti < riders[dri].trips.length && !improved; dti++) {
+              if (sri === dri && sti === dti) continue;
+              const dstTrip = riders[dri].trips[dti];
+              if (dstTrip.deliveries.length > 0 && dstTrip.deliveries[0].slot !== delivery.slot) continue;
+              if (dstTrip.deliveries.length >= cfg.maxDeliveriesPerTrip) continue;
+              if (dstTrip.totalPizzas + delivery.numPizzas > cfg.pizzeCapacity) continue;
+
+              // Build new source without this delivery
+              const newSrc = deepCloneTrip(srcTrip);
+              newSrc.deliveries.splice(di, 1);
+              newSrc.totalPizzas = newSrc.deliveries.reduce((s, d) => s + d.numPizzas, 0);
+              if (newSrc.deliveries.length > 0) calcTripTimes(newSrc, pizzeria, cfg);
+
+              // Try cheapest insertion into destination
+              const dstCandidates = cheapestInsertion(dstTrip, delivery, pizzeria, cfg);
+              if (!dstCandidates.length) continue;
+              const newDst = dstCandidates[0];
+
+              // Check improvement
+              const oldTotal = srcTrip.returnTime + dstTrip.returnTime;
+              const newTotal = (newSrc.deliveries.length > 0 ? newSrc.returnTime : 0) + newDst.returnTime;
+              if (newTotal >= oldTotal - 0.01) continue;
+
+              // Validate timeline conflicts
+              let valid;
+              if (sri === dri) {
+                const tempTrips = riders[sri].trips.map((t, i) =>
+                  i === sti ? newSrc : i === dti ? newDst : t
+                ).filter(t => t.deliveries.length > 0);
+                valid = !riderHasConflicts(tempTrips);
+              } else {
+                const srcTrips = riders[sri].trips.map((t, i) => i === sti ? newSrc : t).filter(t => t.deliveries.length > 0);
+                const dstTrips = riders[dri].trips.map((t, i) => i === dti ? newDst : t);
+                valid = !riderHasConflicts(srcTrips) && !riderHasConflicts(dstTrips);
+              }
+              if (!valid) continue;
+
+              // Apply move
+              riders[sri].trips[sti] = newSrc;
+              riders[dri].trips[dti] = newDst;
+              for (const r of riders) r.trips = r.trips.filter(t => t.deliveries.length > 0);
+              improved = true;
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+// ── Rider availability constraint ──
+
+function countUnavailableRidersForSlot(riders, slotTime, cfg) {
+  const nextSlot = slotTime + cfg.slotDurationMin;
+  const deadline = nextSlot - cfg.earlyToleranceMin;
+  let count = 0;
+  for (const rider of riders) {
+    for (const trip of rider.trips) {
+      if (trip.deliveries.length && trip.deliveries[0].slot === slotTime) {
+        if (tripReturnTime(trip) > deadline) { count++; break; }
+      }
+    }
+  }
+  return count;
+}
+
+function slotAvailabilityValid(riders, cfg) {
+  const slotTimes = new Set();
+  for (const r of riders) for (const t of r.trips) for (const d of t.deliveries) slotTimes.add(d.slot);
+  const maxUnavailable = cfg.numRiders - 1;
+  for (const slotTime of slotTimes) {
+    if (countUnavailableRidersForSlot(riders, slotTime, cfg) > maxUnavailable) return false;
+  }
+  return true;
+}
+
+// Main: calculate available slots using global re-optimization
+function calcAvailableSlots(slots, newCoord, numPizzas, orderId, riders, pizzeria, cfg) {
+  if (numPizzas > cfg.pizzeCapacity) return [];
+  const existingDeliveries = extractAllDeliveries(riders);
+  const currentCost = totalReturnTimeAll(riders);
+  const results = [];
+
+  for (const slot of slots) {
+    const newDel = { id: orderId, lat: newCoord.lat, lng: newCoord.lng, numPizzas, slot };
+    const allDeliveries = [...existingDeliveries, newDel];
+
+    const newRiders = rebuildAllRoutes(allDeliveries, riders.length, pizzeria, cfg);
+    twoOptAll(newRiders, pizzeria, cfg);
+    orOpt(newRiders, pizzeria, cfg);
+
+    // Verify ALL deliveries (existing + new) were assigned
+    const assignedIds = new Set();
+    for (const r of newRiders) for (const t of r.trips) for (const d of t.deliveries) assignedIds.add(d.id);
+    if (assignedIds.size !== allDeliveries.length) continue;
+
+    // Post-hoc: verify rider availability constraint (may be violated by local search)
+    if (!slotAvailabilityValid(newRiders, cfg)) continue;
+
+    const cost = totalReturnTimeAll(newRiders) - currentCost;
+    results.push({ slot, newRiders, cost, orderId });
+  }
+
   return results;
 }
 
@@ -144,7 +354,8 @@ const PIZZERIA_DEFAULT = { lat: 45.428978, lng: 12.077287 };
 
 const DEFAULT_CFG = {
   numRiders: 2, pizzeCapacity: 12, tMaxMin: 30, earlyToleranceMin: 5, lateToleranceMin: 10,
-  detourFactor: 1.3, avgSpeedKmh: 25, stopTimeMin: 3, newTripPenalty: 1.5,
+  detourFactor: 1.3, avgSpeedKmh: 25, stopTimeMin: 3, newTripPenalty: 1.5, maxDeliveriesPerTrip: 3,
+  distToleranceFactor: 1.0, slotDurationMin: 15,
 };
 
 const timeStr = (min) => {
@@ -280,7 +491,7 @@ export default function App() {
       rider.trips.forEach((trip, ti) => {
         const tripKey = `${ri}-${ti}`;
         const isSelected = selectedTripKey === tripKey;
-        const opacity = selectedTripKey ? (isSelected ? 1 : 0.25) : 0.8;
+        const opacity = previewSlot ? 0.15 : (selectedTripKey ? (isSelected ? 1 : 0.25) : 0.8);
 
         // Route polyline
         const points = [
@@ -313,16 +524,29 @@ export default function App() {
       });
     });
 
-    // Preview
-    if (previewSlot) {
-      const trip = previewSlot.trip;
-      const rColor = RIDER_COLORS[previewSlot.riderId % RIDER_COLORS.length];
-      const pts = [
-        [pizzeria.lat, pizzeria.lng],
-        ...trip.deliveries.map((d) => [d.lat, d.lng]),
-        [pizzeria.lat, pizzeria.lng],
-      ];
-      L.polyline(pts, { color: "#fbbf24", weight: 4, opacity: 0.9, dashArray: "6 6" }).addTo(preview);
+    // Preview: draw all routes from the re-optimized assignment
+    if (previewSlot && previewSlot.newRiders) {
+      previewSlot.newRiders.forEach((rider, ri) => {
+        const color = RIDER_COLORS[ri % RIDER_COLORS.length];
+        rider.trips.forEach((trip) => {
+          const pts = [
+            [pizzeria.lat, pizzeria.lng],
+            ...trip.deliveries.map((d) => [d.lat, d.lng]),
+            [pizzeria.lat, pizzeria.lng],
+          ];
+          L.polyline(pts, { color, weight: 4, opacity: 0.9, dashArray: "6 6" }).addTo(preview);
+          trip.deliveries.forEach((d, di) => {
+            const icon = L.divIcon({
+              html: `<div style="background:${color};border:2px solid #fff;border-radius:50%;width:20px;height:20px;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:700;color:#fff;box-shadow:0 0 8px ${color}80;">${di + 1}</div>`,
+              iconSize: [20, 20], iconAnchor: [10, 10], className: "",
+            });
+            const arrTime = trip.arrivalTimes ? timeStr(trip.arrivalTimes[di]) : "?";
+            L.marker([d.lat, d.lng], { icon })
+              .bindTooltip(`${d.id} · ${d.numPizzas}p · arrivo ${arrTime}`, { direction: "top", offset: [0, -12] })
+              .addTo(preview);
+          });
+        });
+      });
     }
   }, [riders, pizzeria, selectedTripKey, previewSlot, mapReady]);
 
@@ -331,23 +555,12 @@ export default function App() {
   // ── Actions ──
   const loadPreset = () => {
     _idCounter = 0;
-    const newRiders = Array.from({ length: cfg.numRiders }, (_, i) => ({ id: i, trips: [] }));
-    // Assign preset orders using the algorithm itself, one by one
-    for (const po of PRESET_ORDERS) {
-      const id = nextId();
-      const res = calcAvailableSlots(
-        [po.slot], { lat: po.lat, lng: po.lng }, po.numPizzas, id, newRiders, pizzeria, cfg
-      );
-      if (res.length > 0) {
-        const best = res[0];
-        const rider = newRiders[best.riderId];
-        if (best.type === "inserimento") {
-          rider.trips[best.origTripIdx] = best.trip;
-        } else {
-          rider.trips.push(best.trip);
-        }
-      }
-    }
+    const deliveries = PRESET_ORDERS.map((po) => ({
+      id: nextId(), lat: po.lat, lng: po.lng, numPizzas: po.numPizzas, slot: po.slot,
+    }));
+    const newRiders = rebuildAllRoutes(deliveries, cfg.numRiders, pizzeria, cfg);
+    twoOptAll(newRiders, pizzeria, cfg);
+    orOpt(newRiders, pizzeria, cfg);
     setRiders(newRiders);
     setAvailableSlots(null);
     setPreviewSlot(null);
@@ -372,14 +585,7 @@ export default function App() {
   };
 
   const confirmSlot = (slotResult) => {
-    const newRiders = riders.map((r) => ({ ...r, trips: r.trips.map((t) => deepCloneTrip(t)) }));
-    const rider = newRiders[slotResult.riderId];
-    if (slotResult.type === "inserimento") {
-      rider.trips[slotResult.origTripIdx] = slotResult.trip;
-    } else {
-      rider.trips.push(slotResult.trip);
-    }
-    setRiders(newRiders);
+    setRiders(slotResult.newRiders);
     setAvailableSlots(null);
     setPreviewSlot(null);
     setNewOrderPos(null);
@@ -444,6 +650,9 @@ export default function App() {
             ["Velocità (km/h)", "avgSpeedKmh", 10, 50, 5],
             ["Sosta (min)", "stopTimeMin", 1, 10, 1],
             ["Penalità nuovo giro", "newTripPenalty", 1.0, 3.0, 0.1],
+            ["Max consegne/giro", "maxDeliveriesPerTrip", 1, 10, 1],
+            ["Tolleranza distanza (min/km)", "distToleranceFactor", 0, 3.0, 0.1],
+            ["Durata slot (min)", "slotDurationMin", 5, 30, 5],
           ].map(([label, key, min, max, step]) => (
             <label key={key} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12 }}>
               <span style={{ color: "#94a3b8" }}>{label}</span>
@@ -550,7 +759,12 @@ export default function App() {
                   <div style={{ maxHeight: 400, overflowY: "auto" }}>
                     {availableSlots.map((sr, i) => {
                       const isHover = previewSlot === sr;
-                      const rColor = RIDER_COLORS[sr.riderId % RIDER_COLORS.length];
+                      // Find which rider has the new delivery
+                      const newDelRi = sr.newRiders.findIndex(r =>
+                        r.trips.some(t => t.deliveries.some(d => d.id === sr.orderId))
+                      );
+                      const rColor = RIDER_COLORS[Math.max(0, newDelRi) % RIDER_COLORS.length];
+                      const totalTrips = sr.newRiders.reduce((s, r) => s + r.trips.length, 0);
                       return (
                         <div key={i}
                           onMouseEnter={() => setPreviewSlot(sr)}
@@ -566,12 +780,11 @@ export default function App() {
                             <span style={{ fontWeight: 700, fontSize: 14 }}>{timeStr(sr.slot)}</span>
                             <span style={{ display: "flex", alignItems: "center", gap: 4 }}>
                               <div style={{ width: 8, height: 8, borderRadius: "50%", background: rColor }} />
-                              <span style={{ fontSize: 11 }}>#{sr.riderId + 1}</span>
+                              <span style={{ fontSize: 11 }}>#{newDelRi + 1}</span>
                             </span>
                           </div>
                           <div style={{ fontSize: 10, color: "#94a3b8", marginTop: 2 }}>
-                            {sr.type === "inserimento" ? "Inserimento in giro esistente" : "Nuovo giro"}
-                            {" · "}{sr.trip.deliveries.length} cons. · costo {Math.round(sr.cost)}s
+                            {totalTrips} giri · costo +{Math.round(sr.cost * 60)}s
                           </div>
                         </div>
                       );
@@ -653,7 +866,7 @@ function Timeline({ riders, slots, timeRange, selectedTripKey, setSelectedTripKe
                 const h = LANE_H - 14;
                 const ty = y + 5;
                 return (
-                  <g key={ti} style={{ cursor: "pointer" }} onClick={() => setSelectedTripKey(isSel ? null : tripKey)}>
+                  <g key={ti} style={{ cursor: "pointer", opacity: previewSlot ? 0.2 : 1 }} onClick={() => setSelectedTripKey(isSel ? null : tripKey)}>
                     <rect x={x1} y={ty} width={Math.max(x2 - x1, 4)} height={h} rx={5}
                       fill={color + (isSel ? "50" : "30")}
                       stroke={isSel ? color : color + "80"} strokeWidth={isSel ? 2 : 1} />
@@ -677,18 +890,19 @@ function Timeline({ riders, slots, timeRange, selectedTripKey, setSelectedTripKe
                 );
               })}
 
-              {/* Preview trip */}
-              {previewSlot && previewSlot.riderId === ri && (() => {
-                const trip = previewSlot.trip;
-                const px1 = tScale(trip.departureTime);
-                const px2 = tScale(tripReturnTime(trip));
-                const ph = LANE_H - 14;
-                const py = y + 5;
-                return (
-                  <rect x={px1} y={py} width={Math.max(px2 - px1, 4)} height={ph} rx={5}
-                    fill="#fbbf2430" stroke="#fbbf24" strokeWidth={2} strokeDasharray="4 3" />
-                );
-              })()}
+              {/* Preview trips from re-optimized assignment */}
+              {previewSlot && previewSlot.newRiders && previewSlot.newRiders[ri] &&
+                previewSlot.newRiders[ri].trips.map((trip, pti) => {
+                  const px1 = tScale(trip.departureTime);
+                  const px2 = tScale(tripReturnTime(trip));
+                  const ph = LANE_H - 14;
+                  const py = y + 5;
+                  return (
+                    <rect key={`preview-${pti}`} x={px1} y={py} width={Math.max(px2 - px1, 4)} height={ph} rx={5}
+                      fill={color + "20"} stroke={color} strokeWidth={2} strokeDasharray="4 3" />
+                  );
+                })
+              }
             </g>
           );
         })}
