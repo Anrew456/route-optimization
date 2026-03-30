@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 
 // ═══════════════════════════════════════════════════════════════════
-// ALGORITHM — JS port faithful to the Python implementation
+// ALGORITHM
 // ═══════════════════════════════════════════════════════════════════
 
 function haversineKm(a, b) {
@@ -53,8 +53,26 @@ function isTripValid(trip, pizzeria, cfg) {
   if (!trip.deliveries.length) return true;
   if (trip.totalPizzas > cfg.pizzeCapacity) return false;
   if (trip.deliveries.length > cfg.maxDeliveriesPerTrip) return false;
-  // Departure floor: rider cannot leave before slot - earlyToleranceMin
   if (trip.departureTime < trip.deliveries[0].slot - cfg.earlyToleranceMin) return false;
+
+  // ─── TOLLERANZA GEOMETRICA CONTINUA ───
+  // Più spatialElasticity è alto, più è permissivo con giri che hanno consegne vicine
+  const ELASTICITA = cfg.spatialElasticity;
+  let maxDist = 0, farthestDel = null;
+  for (const d of trip.deliveries) {
+    const dist = haversineKm(pizzeria, d);
+    if (dist > maxDist) { maxDist = dist; farthestDel = d; }
+  }
+  const deviazioneMassimaPermessa = ELASTICITA / Math.max(maxDist, 0.1);
+  if (trip.deliveries.length > 1) {
+    for (const d of trip.deliveries) {
+      if (d === farthestDel) continue;
+      const deviazioneReale = haversineKm(pizzeria, d) + haversineKm(d, farthestDel) - maxDist;
+      if (deviazioneReale > deviazioneMassimaPermessa) return false;
+    }
+  }
+  // ──────────────────────────────────────
+
   let pos = pizzeria, t = trip.departureTime;
   for (const d of trip.deliveries) {
     t += travelMin(pos, d, cfg);
@@ -178,7 +196,7 @@ function rebuildAllRoutes(allDeliveries, numRiders, pizzeria, cfg) {
           if (cfg.availabilityConstraint) {
             const origTrip = rider.trips[ti];
             rider.trips[ti] = cand;
-            const availOk = countUnavailableRidersForSlot(riders, del.slot, cfg) < cfg.numRiders;
+            const availOk = countUnavailableRidersForSlot(riders, del.slot, pizzeria, cfg) < cfg.numRiders;
             rider.trips[ti] = origTrip;
             if (!availOk) continue;
           }
@@ -208,7 +226,7 @@ function rebuildAllRoutes(allDeliveries, numRiders, pizzeria, cfg) {
       if (isTripValid(newTrip, pizzeria, cfg) && !hasTimelineConflict(rider.trips, newTrip, -1)) {
         if (cfg.availabilityConstraint) {
           rider.trips.push(newTrip);
-          const availOk = countUnavailableRidersForSlot(riders, del.slot, cfg) < cfg.numRiders;
+          const availOk = countUnavailableRidersForSlot(riders, del.slot, pizzeria, cfg) < cfg.numRiders;
           rider.trips.pop();
           if (!availOk) continue;
         }
@@ -349,26 +367,25 @@ function orOpt(riders, pizzeria, cfg) {
 
 // ── Rider availability constraint ──
 
-function countUnavailableRidersForSlot(riders, slotTime, cfg) {
-  const nextSlot = slotTime + cfg.slotDurationMin;
-  const deadline = nextSlot - cfg.earlyToleranceMin;
+function countUnavailableRidersForSlot(riders, slotTime, pizzeria, cfg) {
   let count = 0;
   for (const rider of riders) {
     for (const trip of rider.trips) {
       if (trip.deliveries.length && trip.deliveries[0].slot === slotTime) {
-        if (tripReturnTime(trip) > deadline) { count++; break; }
+        const maxTravelTime = Math.max(...trip.deliveries.map(d => travelMin(pizzeria, d, cfg)));
+        if (maxTravelTime > cfg.earlyToleranceMin) { count++; break; }
       }
     }
   }
   return count;
 }
 
-function slotAvailabilityValid(riders, cfg) {
+function slotAvailabilityValid(riders, pizzeria, cfg) {
   const slotTimes = new Set();
   for (const r of riders) for (const t of r.trips) for (const d of t.deliveries) slotTimes.add(d.slot);
   const maxUnavailable = cfg.numRiders - 1;
   for (const slotTime of slotTimes) {
-    if (countUnavailableRidersForSlot(riders, slotTime, cfg) > maxUnavailable) return false;
+    if (countUnavailableRidersForSlot(riders, slotTime, pizzeria, cfg) > maxUnavailable) return false;
   }
   return true;
 }
@@ -393,7 +410,7 @@ function calcAvailableSlots(slots, newCoord, numPizzas, orderId, riders, pizzeri
     for (const r of newRiders) for (const t of r.trips) for (const d of t.deliveries) assignedIds.add(d.id);
     if (assignedIds.size !== allDeliveries.length) continue;
 
-    if (cfg.availabilityConstraint && !slotAvailabilityValid(newRiders, cfg)) continue;
+    if (cfg.availabilityConstraint && !slotAvailabilityValid(newRiders, pizzeria, cfg)) continue;
 
     const cost = totalCost(newRiders, cfg) - currentCost;
     results.push({ slot, newRiders, cost, orderId });
@@ -415,6 +432,7 @@ const DEFAULT_CFG = {
   distToleranceFactor: 1.0, slotDurationMin: 15,
   costMethod: "perConsegna", // "perConsegna" (V1) oppure "savings" (V3)
   deviationWeight: 1.0, // peso penalità deviazione |arrivo - slot|
+  spatialElasticity: 6.0, // tolleranza geometrica: più alto = più permissivo
   availabilityConstraint: true, // vincolo: almeno 1 fattorino libero per slot successivo
 };
 
@@ -714,6 +732,7 @@ export default function App() {
             ["Tolleranza distanza (min/km)", "distToleranceFactor", 0, 3.0, 0.1],
             ["Durata slot (min)", "slotDurationMin", 5, 30, 5],
             ["Peso deviazione", "deviationWeight", 0, 5.0, 0.1],
+            ["Elasticità spaziale", "spatialElasticity", 0.5, 30.0, 0.5],
           ].map(([label, key, min, max, step]) => (
             <label key={key} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12 }}>
               <span style={{ color: "#94a3b8" }}>{label}</span>
@@ -889,7 +908,7 @@ export default function App() {
 // TIMELINE COMPONENT
 // ═══════════════════════════════════════════════════════════════════
 
-function Timeline({ riders, slots, timeRange, selectedTripKey, setSelectedTripKey, previewSlot, cfg }) {
+function Timeline({ riders, slots, timeRange, selectedTripKey, setSelectedTripKey, previewSlot }) {
   const containerRef = useRef(null);
   const [width, setWidth] = useState(900);
   useEffect(() => {
