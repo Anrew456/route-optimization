@@ -115,14 +115,22 @@ function riderHasConflicts(trips) {
   for (let i = 0; i < trips.length; i++)
     for (let j = i + 1; j < trips.length; j++)
       if (trips[i].departureTime < tripReturnTime(trips[j]) &&
-          trips[j].departureTime < tripReturnTime(trips[i]))
+        trips[j].departureTime < tripReturnTime(trips[i]))
         return true;
   return false;
 }
 
-function totalReturnTimeAll(riders) {
+function totalCost(riders, cfg) {
   let total = 0;
-  for (const r of riders) for (const t of r.trips) total += t.returnTime;
+  for (const r of riders)
+    for (const t of r.trips) {
+      if (cfg.costMethod === "savings") {
+        total += t.returnTime;
+      } else {
+        // perConsegna (V1)
+        total += t.returnTime / t.deliveries.length;
+      }
+    }
   return total;
 }
 
@@ -138,6 +146,11 @@ function rebuildAllRoutes(allDeliveries, numRiders, pizzeria, cfg) {
 
   for (const del of sorted) {
     let bestOption = null, bestCost = Infinity;
+
+    // Costo standalone: giro con solo questa consegna (serve per V3-savings)
+    const standaloneTrip = { deliveries: [{ ...del }], totalPizzas: del.numPizzas };
+    calcTripTimes(standaloneTrip, pizzeria, cfg);
+    const standaloneSec = standaloneTrip.returnTime * 60;
 
     for (let ri = 0; ri < riders.length; ri++) {
       const rider = riders[ri];
@@ -158,7 +171,17 @@ function rebuildAllRoutes(allDeliveries, numRiders, pizzeria, cfg) {
           const availOk = countUnavailableRidersForSlot(riders, del.slot, cfg) < cfg.numRiders;
           rider.trips[ti] = origTrip;
           if (!availOk) continue;
-          const cost = (cand.returnTime - trip.returnTime) * 60;
+
+          let cost;
+          if (cfg.costMethod === "savings") {
+            const delta = (cand.returnTime - trip.returnTime) * 60;
+            const savings = standaloneSec - delta;
+            cost = delta * (standaloneSec / Math.max(savings, 60));
+          } else {
+            // perConsegna (V1)
+            cost = (cand.returnTime * 60) / cand.deliveries.length;
+          }
+
           if (cost < bestCost) {
             bestCost = cost;
             bestOption = { riderId: ri, tripIdx: ti, trip: cand };
@@ -176,7 +199,15 @@ function rebuildAllRoutes(allDeliveries, numRiders, pizzeria, cfg) {
         const availOk = countUnavailableRidersForSlot(riders, del.slot, cfg) < cfg.numRiders;
         rider.trips.pop();
         if (!availOk) continue;
-        const cost = newTrip.returnTime * 60 * cfg.newTripPenalty + rider.trips.length * 0.001;
+
+        let cost;
+        if (cfg.costMethod === "savings") {
+          cost = standaloneSec + rider.trips.length * 0.001;
+        } else {
+          // perConsegna (V1): giro da 1 consegna, costo = returnTime
+          cost = newTrip.returnTime * 60 + rider.trips.length * 0.001;
+        }
+
         if (cost < bestCost) {
           bestCost = cost;
           bestOption = { riderId: ri, tripIdx: -1, trip: newTrip };
@@ -258,8 +289,17 @@ function orOpt(riders, pizzeria, cfg) {
               const newDst = dstCandidates[0];
 
               // Check improvement
-              const oldTotal = srcTrip.returnTime + dstTrip.returnTime;
-              const newTotal = (newSrc.deliveries.length > 0 ? newSrc.returnTime : 0) + newDst.returnTime;
+              let oldTotal, newTotal;
+              if (cfg.costMethod === "savings") {
+                oldTotal = srcTrip.returnTime + dstTrip.returnTime;
+                newTotal = (newSrc.deliveries.length > 0 ? newSrc.returnTime : 0) + newDst.returnTime;
+              } else {
+                // perConsegna (V1)
+                oldTotal = srcTrip.returnTime / srcTrip.deliveries.length
+                  + dstTrip.returnTime / dstTrip.deliveries.length;
+                newTotal = (newSrc.deliveries.length > 0 ? newSrc.returnTime / newSrc.deliveries.length : 0)
+                  + newDst.returnTime / newDst.deliveries.length;
+              }
               if (newTotal >= oldTotal - 0.01) continue;
 
               // Validate timeline conflicts
@@ -319,7 +359,7 @@ function slotAvailabilityValid(riders, cfg) {
 function calcAvailableSlots(slots, newCoord, numPizzas, orderId, riders, pizzeria, cfg) {
   if (numPizzas > cfg.pizzeCapacity) return [];
   const existingDeliveries = extractAllDeliveries(riders);
-  const currentCost = totalReturnTimeAll(riders);
+  const currentCost = totalCost(riders, cfg);
   const results = [];
 
   for (const slot of slots) {
@@ -338,7 +378,7 @@ function calcAvailableSlots(slots, newCoord, numPizzas, orderId, riders, pizzeri
     // Post-hoc: verify rider availability constraint (may be violated by local search)
     if (!slotAvailabilityValid(newRiders, cfg)) continue;
 
-    const cost = totalReturnTimeAll(newRiders) - currentCost;
+    const cost = totalCost(newRiders, cfg) - currentCost;
     results.push({ slot, newRiders, cost, orderId });
   }
 
@@ -356,6 +396,7 @@ const DEFAULT_CFG = {
   numRiders: 2, pizzeCapacity: 12, tMaxMin: 30, earlyToleranceMin: 5, lateToleranceMin: 10,
   detourFactor: 1.3, avgSpeedKmh: 25, stopTimeMin: 3, newTripPenalty: 1.5, maxDeliveriesPerTrip: 3,
   distToleranceFactor: 1.0, slotDurationMin: 15,
+  costMethod: "perConsegna", // "perConsegna" (V1) oppure "savings" (V3)
 };
 
 const timeStr = (min) => {
@@ -662,6 +703,16 @@ export default function App() {
               />
             </label>
           ))}
+          <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12 }}>
+            <span style={{ color: "#94a3b8" }}>Metodo costo</span>
+            <select value={cfg.costMethod}
+              onChange={(e) => setCfg((c) => ({ ...c, costMethod: e.target.value }))}
+              style={{ background: "#0f172a", border: "1px solid #475569", borderRadius: 4, padding: "3px 6px", color: "#e2e8f0", fontSize: 12 }}
+            >
+              <option value="perConsegna">Per consegna (V1)</option>
+              <option value="savings">Savings (V3)</option>
+            </select>
+          </label>
         </div>
       )}
 

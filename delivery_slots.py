@@ -31,6 +31,7 @@ class Config:
     velocita_media_kmh: float = 25.0  # velocità media fattorino
     tempo_sosta_minuti: float = 3.0  # tempo per ogni consegna (parcheggio, citofono...)
     penalita_nuovo_giro: float = 1.5  # fattore penalità per preferire inserimenti
+    max_consegne_per_giro: int = 3  # massimo numero di consegne per giro
 
     @property
     def t_max(self) -> timedelta:
@@ -217,6 +218,10 @@ def giro_valido(giro: Giro, pizzeria: Coordinate, config: Config) -> bool:
     if giro.pizze_totali > config.capacita_pizze:
         return False
 
+    # Vincolo numero massimo consegne per giro
+    if len(giro.consegne) > config.max_consegne_per_giro:
+        return False
+
     # Vincolo T_max
     if giro.tempo_totale > config.t_max:
         return False
@@ -303,8 +308,327 @@ def cheapest_insertion(
 
 
 # ---------------------------------------------------------------------------
-# Algoritmo principale
+# Ri-ottimizzazione globale
 # ---------------------------------------------------------------------------
+
+
+def estrai_tutte_consegne(fattorini: list[Fattorino]) -> list[Consegna]:
+    """Raccoglie tutte le consegne da tutti i giri di tutti i fattorini."""
+    consegne: list[Consegna] = []
+    for f in fattorini:
+        for g in f.giri:
+            for c in g.consegne:
+                consegne.append(
+                    Consegna(
+                        id=c.id,
+                        coordinate=Coordinate(c.coordinate.lat, c.coordinate.lon),
+                        num_pizze=c.num_pizze,
+                        slot=c.slot,
+                    )
+                )
+    return consegne
+
+
+def fattorino_ha_conflitti(giri: list[Giro]) -> bool:
+    """Verifica se ci sono sovrapposizioni tra i giri di un fattorino."""
+    for i in range(len(giri)):
+        for j in range(i + 1, len(giri)):
+            if giri[i].orario_partenza < orario_ritorno(giri[j]) and \
+               giri[j].orario_partenza < orario_ritorno(giri[i]):
+                return True
+    return False
+
+
+def costo_totale(fattorini: list[Fattorino]) -> float:
+    """Costo complessivo di tutti i giri."""
+    total = 0.0
+    for f in fattorini:
+        for g in f.giri:
+            if g.tempo_ritorno:
+                # --- Variante 1: costo per consegna ---
+                total += g.tempo_ritorno.total_seconds() / len(g.consegne)
+                # --- Variante 3: savings (usa tempo di ritorno grezzo) ---
+                # total += g.tempo_ritorno.total_seconds()
+    return total
+
+
+def ricostruisci_giri(
+    tutte_consegne: list[Consegna],
+    num_fattorini: int,
+    pizzeria: Coordinate,
+    config: Config,
+) -> list[Fattorino]:
+    """
+    Ricostruisce tutti i giri da zero con round-robin seeding + cheapest insertion.
+
+    Fase 1 (round-robin): per ogni slot, assegna le prime consegne a fattorini diversi
+    (una per fattorino, partendo dal meno carico) per bilanciare il carico.
+
+    Fase 2 (greedy): le consegne rimanenti vengono inserite con cheapest insertion
+    o creano nuovi giri (con penalità).
+
+    Seed ordering: per slot (crescente), poi per distanza dalla pizzeria (decrescente).
+    """
+    # Seed ordering
+    ordinati = sorted(
+        tutte_consegne,
+        key=lambda c: (c.slot, -haversine_km(pizzeria, c.coordinate)),
+    )
+
+    fattorini = [Fattorino(id=i + 1) for i in range(num_fattorini)]
+
+    # -- Fase 1: round-robin seeding per slot --
+    # Raggruppa per slot
+    consegne_per_slot: dict[datetime, list[Consegna]] = {}
+    for c in ordinati:
+        consegne_per_slot.setdefault(c.slot, []).append(c)
+
+    assegnate: set[str] = set()
+
+    for slot in sorted(consegne_per_slot.keys()):
+        consegne_slot = consegne_per_slot[slot]
+        n_seeds = min(len(consegne_slot), num_fattorini)
+
+        # Fattorini ordinati per carico crescente (meno giri prima)
+        fattorini_ordinati = sorted(fattorini, key=lambda f: len(f.giri))
+
+        for i in range(n_seeds):
+            consegna = consegne_slot[i]
+            fattorino = fattorini_ordinati[i]
+
+            nuovo_giro = Giro(fattorino_id=fattorino.id, consegne=[consegna])
+            calcola_tempi_giro(nuovo_giro, pizzeria, config)
+
+            if giro_valido(nuovo_giro, pizzeria, config) and not causa_conflitto_timeline(
+                fattorino, nuovo_giro, None
+            ):
+                fattorino.giri.append(nuovo_giro)
+                assegnate.add(consegna.id)
+
+    # -- Fase 2: greedy insertion per le consegne rimanenti --
+    rimanenti = [c for c in ordinati if c.id not in assegnate]
+
+    for consegna in rimanenti:
+        miglior_opzione = None
+        miglior_costo = float("inf")
+
+        # Costo standalone: giro con solo questa consegna (serve per V3)
+        giro_standalone = Giro(fattorino_id=0, consegne=[consegna])
+        calcola_tempi_giro(giro_standalone, pizzeria, config)
+        standalone_sec = giro_standalone.tempo_ritorno.total_seconds()
+
+        for fattorino in fattorini:
+            # Opzione A: inserire in un giro esistente
+            for idx_giro, giro in enumerate(fattorino.giri):
+                if giro.pizze_totali + consegna.num_pizze > config.capacita_pizze:
+                    continue
+                if len(giro.consegne) >= config.max_consegne_per_giro:
+                    continue
+                # Single-slot: solo giri con lo stesso slot
+                if giro.consegne and giro.consegne[0].slot != consegna.slot:
+                    continue
+
+                candidati = cheapest_insertion(giro, consegna, pizzeria, config)
+                for giro_candidato in candidati:
+                    if causa_conflitto_timeline(fattorino, giro_candidato, giro):
+                        continue
+                    delta = (
+                        giro_candidato.tempo_ritorno - giro.tempo_ritorno
+                    ).total_seconds()
+
+                    # --- Variante 1: costo per consegna ---
+                    costo = (
+                        giro_candidato.tempo_ritorno.total_seconds()
+                        / len(giro_candidato.consegne)
+                    )
+                    # --- Variante 3: savings ---
+                    # savings = standalone_sec - delta
+                    # costo = delta * (standalone_sec / max(savings, 60))
+
+                    if costo < miglior_costo:
+                        miglior_costo = costo
+                        miglior_opzione = (
+                            "inserimento",
+                            fattorino,
+                            idx_giro,
+                            giro_candidato,
+                        )
+                    break
+
+            # Opzione B: nuovo giro
+            nuovo_giro = Giro(fattorino_id=fattorino.id, consegne=[consegna])
+            calcola_tempi_giro(nuovo_giro, pizzeria, config)
+            if giro_valido(nuovo_giro, pizzeria, config) and not causa_conflitto_timeline(
+                fattorino, nuovo_giro, None
+            ):
+                # --- Variante 1: costo per consegna ---
+                costo = (
+                    nuovo_giro.tempo_ritorno.total_seconds()
+                    + len(fattorino.giri) * 0.001
+                )
+                # --- Variante 3: savings ---
+                # costo = standalone_sec + len(fattorino.giri) * 0.001
+
+                if costo < miglior_costo:
+                    miglior_costo = costo
+                    miglior_opzione = (
+                        "nuovo_giro",
+                        fattorino,
+                        -1,
+                        nuovo_giro,
+                    )
+
+        if miglior_opzione:
+            tipo, fattorino, idx, giro_result = miglior_opzione
+            if tipo == "inserimento":
+                fattorino.giri[idx] = giro_result
+            else:
+                fattorino.giri.append(giro_result)
+
+    return fattorini
+
+
+def two_opt(giro: Giro, pizzeria: Coordinate, config: Config) -> Giro:
+    """Migliora l'ordine delle consegne invertendo sotto-sequenze (2-opt)."""
+    n = len(giro.consegne)
+    if n < 3:
+        return giro
+
+    best = deepcopy(giro)
+    improved = True
+    while improved:
+        improved = False
+        for i in range(n - 1):
+            for j in range(i + 2, n):
+                candidato = deepcopy(best)
+                candidato.consegne[i + 1 : j + 1] = reversed(
+                    candidato.consegne[i + 1 : j + 1]
+                )
+                calcola_tempi_giro(candidato, pizzeria, config)
+                if (
+                    giro_valido(candidato, pizzeria, config)
+                    and candidato.tempo_ritorno < best.tempo_ritorno
+                ):
+                    best = candidato
+                    improved = True
+    return best
+
+
+def two_opt_all(fattorini: list[Fattorino], pizzeria: Coordinate, config: Config) -> None:
+    """Applica 2-opt a tutti i giri."""
+    for f in fattorini:
+        for i, g in enumerate(f.giri):
+            f.giri[i] = two_opt(g, pizzeria, config)
+
+
+def or_opt(fattorini: list[Fattorino], pizzeria: Coordinate, config: Config) -> None:
+    """Prova a spostare ogni consegna in un giro migliore."""
+    improved = True
+    while improved:
+        improved = False
+        for sf in fattorini:
+            if improved:
+                break
+            for si, sg in enumerate(sf.giri):
+                if improved:
+                    break
+                for di in range(len(sg.consegne)):
+                    if improved:
+                        break
+                    consegna = sg.consegne[di]
+                    for df in fattorini:
+                        if improved:
+                            break
+                        for dgi, dg in enumerate(df.giri):
+                            if sf is df and si == dgi:
+                                continue
+                            if dg.consegne and dg.consegne[0].slot != consegna.slot:
+                                continue
+                            if len(dg.consegne) >= config.max_consegne_per_giro:
+                                continue
+                            if dg.pizze_totali + consegna.num_pizze > config.capacita_pizze:
+                                continue
+
+                            # Costruisci source senza la consegna
+                            nuovo_src = deepcopy(sg)
+                            nuovo_src.consegne.pop(di)
+                            if nuovo_src.consegne:
+                                calcola_tempi_giro(nuovo_src, pizzeria, config)
+
+                            # Prova inserimento nel destination
+                            candidati_dst = cheapest_insertion(
+                                dg, consegna, pizzeria, config
+                            )
+                            if not candidati_dst:
+                                continue
+                            nuovo_dst = candidati_dst[0]
+
+                            # Verifica miglioramento
+                            # --- Variante 1: costo per consegna ---
+                            old_total = (
+                                sg.tempo_ritorno.total_seconds() / len(sg.consegne)
+                                + dg.tempo_ritorno.total_seconds() / len(dg.consegne)
+                            )
+                            new_src_cost = (
+                                nuovo_src.tempo_ritorno.total_seconds() / len(nuovo_src.consegne)
+                                if nuovo_src.consegne else 0
+                            )
+                            new_total = (
+                                new_src_cost
+                                + nuovo_dst.tempo_ritorno.total_seconds() / len(nuovo_dst.consegne)
+                            )
+                            # --- Variante 3: savings (usa tempo di ritorno grezzo) ---
+                            # old_total = sg.tempo_ritorno.total_seconds() + dg.tempo_ritorno.total_seconds()
+                            # new_total = (
+                            #     (nuovo_src.tempo_ritorno.total_seconds() if nuovo_src.consegne else 0)
+                            #     + nuovo_dst.tempo_ritorno.total_seconds()
+                            # )
+                            if new_total >= old_total - 0.01:
+                                continue
+
+                            # Verifica conflitti timeline
+                            valid = True
+                            if sf is df:
+                                temp_giri = [
+                                    (nuovo_src if i == si else nuovo_dst if i == dgi else g)
+                                    for i, g in enumerate(sf.giri)
+                                    if not (i == si and not nuovo_src.consegne)
+                                ]
+                                valid = not fattorino_ha_conflitti(temp_giri)
+                            else:
+                                src_giri = [
+                                    (nuovo_src if i == si else g)
+                                    for i, g in enumerate(sf.giri)
+                                    if not (i == si and not nuovo_src.consegne)
+                                ]
+                                dst_giri = [
+                                    (nuovo_dst if i == dgi else g)
+                                    for i, g in enumerate(df.giri)
+                                ]
+                                valid = not fattorino_ha_conflitti(src_giri) and not fattorino_ha_conflitti(dst_giri)
+                            if not valid:
+                                continue
+
+                            # Applica
+                            sf.giri[si] = nuovo_src
+                            df.giri[dgi] = nuovo_dst
+                            for f in fattorini:
+                                f.giri = [g for g in f.giri if g.consegne]
+                            improved = True
+
+
+# ---------------------------------------------------------------------------
+# Algoritmo principale (con ri-ottimizzazione globale)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class SlotDisponibileGlobale:
+    """Risultato della ri-ottimizzazione: lo slot con l'assegnazione completa."""
+
+    slot: datetime
+    fattorini_risultanti: list[Fattorino]
+    costo: float  # incremento costo totale rispetto allo stato attuale
 
 
 def calcola_slot_disponibili(
@@ -315,18 +639,20 @@ def calcola_slot_disponibili(
     fattorini: list[Fattorino],
     pizzeria: Coordinate,
     config: Config,
-) -> list[SlotDisponibile]:
+) -> list[SlotDisponibileGlobale]:
     """
-    Per ogni slot nella lista, determina se è disponibile per il nuovo ordine
-    e quale fattorino assegnare.
+    Per ogni slot nella lista, ricostruisce TUTTI i giri da zero includendo
+    il nuovo ordine, poi applica local search (2-opt + or-opt).
 
-    Restituisce la lista degli slot disponibili con il fattorino ottimale per ciascuno.
+    Restituisce la lista degli slot disponibili con l'assegnazione completa ottimizzata.
     """
 
     if nuovo_ordine_num_pizze > config.capacita_pizze:
-        return []  # ordine troppo grande per qualsiasi fattorino
+        return []
 
-    risultati: list[SlotDisponibile] = []
+    consegne_esistenti = estrai_tutte_consegne(fattorini)
+    costo_attuale = costo_totale(fattorini)
+    risultati: list[SlotDisponibileGlobale] = []
 
     for slot in slot_list:
         nuova_consegna = Consegna(
@@ -335,70 +661,30 @@ def calcola_slot_disponibili(
             num_pizze=nuovo_ordine_num_pizze,
             slot=slot,
         )
+        tutte = consegne_esistenti + [nuova_consegna]
 
-        miglior_opzione: Optional[SlotDisponibile] = None
-        miglior_costo = float("inf")
+        nuovi_fattorini = ricostruisci_giri(
+            tutte, config.num_fattorini, pizzeria, config
+        )
+        two_opt_all(nuovi_fattorini, pizzeria, config)
+        or_opt(nuovi_fattorini, pizzeria, config)
 
-        for fattorino in fattorini:
-            # === OPZIONE A: inserire in un giro esistente ===
-            for giro in fattorino.giri:
-                # Verifica rapida capacità
-                if giro.pizze_totali + nuovo_ordine_num_pizze > config.capacita_pizze:
-                    continue
+        # Verifica che TUTTE le consegne (esistenti + nuova) siano state assegnate
+        ids_assegnati = {
+            c.id for f in nuovi_fattorini for g in f.giri for c in g.consegne
+        }
+        ids_richiesti = {c.id for c in tutte}
+        if ids_assegnati != ids_richiesti:
+            continue
 
-                # Cheapest insertion
-                candidati = cheapest_insertion(giro, nuova_consegna, pizzeria, config)
-
-                for giro_candidato in candidati:
-                    # Verifica conflitti timeline
-                    if causa_conflitto_timeline(fattorino, giro_candidato, giro):
-                        continue
-
-                    # Costo marginale: incremento del tempo totale
-                    costo = (
-                        giro_candidato.tempo_ritorno - giro.tempo_ritorno
-                    ).total_seconds()
-
-                    if costo < miglior_costo:
-                        miglior_costo = costo
-                        miglior_opzione = SlotDisponibile(
-                            slot=slot,
-                            fattorino_id=fattorino.id,
-                            costo=costo,
-                            tipo="inserimento",
-                            giro_risultante=giro_candidato,
-                        )
-
-                    break  # prendi solo il miglior candidato per questo giro
-
-            # === OPZIONE B: creare un nuovo giro ===
-            nuovo_giro = Giro(
-                fattorino_id=fattorino.id,
-                consegne=[nuova_consegna],
+        costo = costo_totale(nuovi_fattorini) - costo_attuale
+        risultati.append(
+            SlotDisponibileGlobale(
+                slot=slot,
+                fattorini_risultanti=nuovi_fattorini,
+                costo=costo,
             )
-            calcola_tempi_giro(nuovo_giro, pizzeria, config)
-
-            if giro_valido(
-                nuovo_giro, pizzeria, config
-            ) and not causa_conflitto_timeline(fattorino, nuovo_giro, None):
-                # Costo pieno con penalità
-                costo = (
-                    nuovo_giro.tempo_ritorno.total_seconds()
-                    * config.penalita_nuovo_giro
-                )
-
-                if costo < miglior_costo:
-                    miglior_costo = costo
-                    miglior_opzione = SlotDisponibile(
-                        slot=slot,
-                        fattorino_id=fattorino.id,
-                        costo=costo,
-                        tipo="nuovo_giro",
-                        giro_risultante=nuovo_giro,
-                    )
-
-        if miglior_opzione is not None:
-            risultati.append(miglior_opzione)
+        )
 
     return risultati
 
@@ -409,31 +695,10 @@ def calcola_slot_disponibili(
 
 
 def conferma_ordine(
-    slot_scelto: SlotDisponibile,
-    fattorini: list[Fattorino],
-    pizzeria: Coordinate,
-    config: Config,
-) -> None:
+    slot_scelto: SlotDisponibileGlobale,
+) -> list[Fattorino]:
     """
-    Dopo che l'operatore ha scelto uno slot, applica l'assegnazione:
-    aggiorna i giri del fattorino.
+    Dopo che l'operatore ha scelto uno slot, restituisce la nuova
+    assegnazione completa dei fattorini (ri-ottimizzata).
     """
-    fattorino = next(f for f in fattorini if f.id == slot_scelto.fattorino_id)
-
-    if slot_scelto.tipo == "inserimento":
-        # Trova e sostituisci il giro originale con quello aggiornato
-        giro_aggiornato = slot_scelto.giro_risultante
-        for i, giro in enumerate(fattorino.giri):
-            if giro.fattorino_id == giro_aggiornato.fattorino_id:
-                # Confronta: il giro originale è quello che, privato della nuova
-                # consegna, corrisponde a un giro esistente.
-                # Usiamo l'euristica: il giro che contiene un sottoinsieme delle
-                # consegne del giro aggiornato.
-                ids_giro = {c.id for c in giro.consegne}
-                ids_aggiornato = {c.id for c in giro_aggiornato.consegne}
-                if ids_giro.issubset(ids_aggiornato):
-                    fattorino.giri[i] = giro_aggiornato
-                    return
-
-    # tipo == "nuovo_giro" oppure fallback
-    fattorino.giri.append(slot_scelto.giro_risultante)
+    return slot_scelto.fattorini_risultanti
