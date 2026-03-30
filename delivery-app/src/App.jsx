@@ -100,6 +100,15 @@ function cheapestInsertion(trip, newDel, pizzeria, cfg) {
   return candidates;
 }
 
+function tripDeviation(trip) {
+  if (!trip.arrivalTimes || !trip.deliveries.length) return 0;
+  let dev = 0;
+  for (let i = 0; i < trip.deliveries.length; i++) {
+    dev += Math.abs(trip.arrivalTimes[i] - trip.deliveries[i].slot);
+  }
+  return dev;
+}
+
 // ── Global re-optimization helpers ──
 
 function extractAllDeliveries(riders) {
@@ -130,6 +139,7 @@ function totalCost(riders, cfg) {
         // perConsegna (V1)
         total += t.returnTime / t.deliveries.length;
       }
+      total += cfg.deviationWeight * tripDeviation(t);
     }
   return total;
 }
@@ -165,12 +175,13 @@ function rebuildAllRoutes(allDeliveries, numRiders, pizzeria, cfg) {
         const candidates = cheapestInsertion(trip, del, pizzeria, cfg);
         for (const cand of candidates) {
           if (hasTimelineConflict(rider.trips, cand, ti)) continue;
-          // Check rider availability: temporarily substitute and verify
-          const origTrip = rider.trips[ti];
-          rider.trips[ti] = cand;
-          const availOk = countUnavailableRidersForSlot(riders, del.slot, cfg) < cfg.numRiders;
-          rider.trips[ti] = origTrip;
-          if (!availOk) continue;
+          if (cfg.availabilityConstraint) {
+            const origTrip = rider.trips[ti];
+            rider.trips[ti] = cand;
+            const availOk = countUnavailableRidersForSlot(riders, del.slot, cfg) < cfg.numRiders;
+            rider.trips[ti] = origTrip;
+            if (!availOk) continue;
+          }
 
           let cost;
           if (cfg.costMethod === "savings") {
@@ -181,6 +192,7 @@ function rebuildAllRoutes(allDeliveries, numRiders, pizzeria, cfg) {
             // perConsegna (V1)
             cost = (cand.returnTime * 60) / cand.deliveries.length;
           }
+          cost += cfg.deviationWeight * tripDeviation(cand);
 
           if (cost < bestCost) {
             bestCost = cost;
@@ -194,11 +206,12 @@ function rebuildAllRoutes(allDeliveries, numRiders, pizzeria, cfg) {
       const newTrip = { deliveries: [{ ...del }], totalPizzas: del.numPizzas };
       calcTripTimes(newTrip, pizzeria, cfg);
       if (isTripValid(newTrip, pizzeria, cfg) && !hasTimelineConflict(rider.trips, newTrip, -1)) {
-        // Check rider availability: temporarily add and verify
-        rider.trips.push(newTrip);
-        const availOk = countUnavailableRidersForSlot(riders, del.slot, cfg) < cfg.numRiders;
-        rider.trips.pop();
-        if (!availOk) continue;
+        if (cfg.availabilityConstraint) {
+          rider.trips.push(newTrip);
+          const availOk = countUnavailableRidersForSlot(riders, del.slot, cfg) < cfg.numRiders;
+          rider.trips.pop();
+          if (!availOk) continue;
+        }
 
         let cost;
         if (cfg.costMethod === "savings") {
@@ -207,6 +220,7 @@ function rebuildAllRoutes(allDeliveries, numRiders, pizzeria, cfg) {
           // perConsegna (V1): giro da 1 consegna, costo = returnTime
           cost = newTrip.returnTime * 60 + rider.trips.length * 0.001;
         }
+        cost += cfg.deviationWeight * tripDeviation(newTrip);
 
         if (cost < bestCost) {
           bestCost = cost;
@@ -300,6 +314,10 @@ function orOpt(riders, pizzeria, cfg) {
                 newTotal = (newSrc.deliveries.length > 0 ? newSrc.returnTime / newSrc.deliveries.length : 0)
                   + newDst.returnTime / newDst.deliveries.length;
               }
+              oldTotal += cfg.deviationWeight * (tripDeviation(srcTrip) + tripDeviation(dstTrip));
+              newTotal += cfg.deviationWeight * (
+                (newSrc.deliveries.length > 0 ? tripDeviation(newSrc) : 0) + tripDeviation(newDst)
+              );
               if (newTotal >= oldTotal - 0.01) continue;
 
               // Validate timeline conflicts
@@ -375,8 +393,7 @@ function calcAvailableSlots(slots, newCoord, numPizzas, orderId, riders, pizzeri
     for (const r of newRiders) for (const t of r.trips) for (const d of t.deliveries) assignedIds.add(d.id);
     if (assignedIds.size !== allDeliveries.length) continue;
 
-    // Post-hoc: verify rider availability constraint (may be violated by local search)
-    if (!slotAvailabilityValid(newRiders, cfg)) continue;
+    if (cfg.availabilityConstraint && !slotAvailabilityValid(newRiders, cfg)) continue;
 
     const cost = totalCost(newRiders, cfg) - currentCost;
     results.push({ slot, newRiders, cost, orderId });
@@ -393,10 +410,12 @@ const RIDER_COLORS = ["#ef4444", "#3b82f6", "#22c55e", "#f59e0b", "#a855f7", "#e
 const PIZZERIA_DEFAULT = { lat: 45.428978, lng: 12.077287 };
 
 const DEFAULT_CFG = {
-  numRiders: 2, pizzeCapacity: 12, tMaxMin: 30, earlyToleranceMin: 5, lateToleranceMin: 10,
-  detourFactor: 1.3, avgSpeedKmh: 25, stopTimeMin: 3, newTripPenalty: 1.5, maxDeliveriesPerTrip: 3,
+  numRiders: 2, pizzeCapacity: 12, tMaxMin: 30, earlyToleranceMin: 10, lateToleranceMin: 10,
+  detourFactor: 1.7, avgSpeedKmh: 25, stopTimeMin: 4, newTripPenalty: 1.5, maxDeliveriesPerTrip: 4,
   distToleranceFactor: 1.0, slotDurationMin: 15,
   costMethod: "perConsegna", // "perConsegna" (V1) oppure "savings" (V3)
+  deviationWeight: 1.0, // peso penalità deviazione |arrivo - slot|
+  availabilityConstraint: true, // vincolo: almeno 1 fattorino libero per slot successivo
 };
 
 const timeStr = (min) => {
@@ -694,6 +713,7 @@ export default function App() {
             ["Max consegne/giro", "maxDeliveriesPerTrip", 1, 10, 1],
             ["Tolleranza distanza (min/km)", "distToleranceFactor", 0, 3.0, 0.1],
             ["Durata slot (min)", "slotDurationMin", 5, 30, 5],
+            ["Peso deviazione", "deviationWeight", 0, 5.0, 0.1],
           ].map(([label, key, min, max, step]) => (
             <label key={key} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12 }}>
               <span style={{ color: "#94a3b8" }}>{label}</span>
@@ -712,6 +732,11 @@ export default function App() {
               <option value="perConsegna">Per consegna (V1)</option>
               <option value="savings">Savings (V3)</option>
             </select>
+          </label>
+          <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12 }}>
+            <input type="checkbox" checked={cfg.availabilityConstraint}
+              onChange={(e) => setCfg((c) => ({ ...c, availabilityConstraint: e.target.checked }))} />
+            <span style={{ color: "#94a3b8" }}>Vincolo disponibilità slot</span>
           </label>
         </div>
       )}
