@@ -32,6 +32,7 @@ class Config:
     tempo_sosta_minuti: float = 3.0  # tempo per ogni consegna (parcheggio, citofono...)
     penalita_nuovo_giro: float = 1.5  # fattore penalità per preferire inserimenti
     max_consegne_per_giro: int = 3  # massimo numero di consegne per giro
+    peso_deviazione: float = 1.0  # peso penalità deviazione |arrivo - slot|
 
     @property
     def t_max(self) -> timedelta:
@@ -196,6 +197,21 @@ def calcola_tempi_giro(
     return giro
 
 
+def deviazione_giro(giro: Giro, pizzeria: Coordinate, config: Config) -> float:
+    """Somma delle deviazioni |arrivo - slot| per ogni consegna (in minuti)."""
+    if not giro.consegne or not giro.orario_partenza:
+        return 0.0
+    pos = pizzeria
+    t = giro.orario_partenza
+    dev = 0.0
+    for consegna in giro.consegne:
+        t += tempo_percorrenza(pos, consegna.coordinate, config)
+        dev += abs((t - consegna.slot).total_seconds()) / 60.0
+        t += config.tempo_sosta
+        pos = consegna.coordinate
+    return dev
+
+
 def orario_ritorno(giro: Giro) -> datetime:
     """Orario in cui il fattorino rientra in pizzeria dopo il giro."""
     return giro.orario_partenza + giro.tempo_ritorno
@@ -339,7 +355,7 @@ def fattorino_ha_conflitti(giri: list[Giro]) -> bool:
     return False
 
 
-def costo_totale(fattorini: list[Fattorino]) -> float:
+def costo_totale(fattorini: list[Fattorino], pizzeria: Coordinate, config: Config) -> float:
     """Costo complessivo di tutti i giri."""
     total = 0.0
     for f in fattorini:
@@ -349,6 +365,7 @@ def costo_totale(fattorini: list[Fattorino]) -> float:
                 total += g.tempo_ritorno.total_seconds() / len(g.consegne)
                 # --- Variante 3: savings (usa tempo di ritorno grezzo) ---
                 # total += g.tempo_ritorno.total_seconds()
+                total += config.peso_deviazione * deviazione_giro(g, pizzeria, config)
     return total
 
 
@@ -444,6 +461,7 @@ def ricostruisci_giri(
                     # --- Variante 3: savings ---
                     # savings = standalone_sec - delta
                     # costo = delta * (standalone_sec / max(savings, 60))
+                    costo += config.peso_deviazione * deviazione_giro(giro_candidato, pizzeria, config)
 
                     if costo < miglior_costo:
                         miglior_costo = costo
@@ -468,6 +486,7 @@ def ricostruisci_giri(
                 )
                 # --- Variante 3: savings ---
                 # costo = standalone_sec + len(fattorino.giri) * 0.001
+                costo += config.peso_deviazione * deviazione_giro(nuovo_giro, pizzeria, config)
 
                 if costo < miglior_costo:
                     miglior_costo = costo
@@ -583,6 +602,13 @@ def or_opt(fattorini: list[Fattorino], pizzeria: Coordinate, config: Config) -> 
                             #     (nuovo_src.tempo_ritorno.total_seconds() if nuovo_src.consegne else 0)
                             #     + nuovo_dst.tempo_ritorno.total_seconds()
                             # )
+                            old_total += config.peso_deviazione * (
+                                deviazione_giro(sg, pizzeria, config) + deviazione_giro(dg, pizzeria, config)
+                            )
+                            new_total += config.peso_deviazione * (
+                                (deviazione_giro(nuovo_src, pizzeria, config) if nuovo_src.consegne else 0)
+                                + deviazione_giro(nuovo_dst, pizzeria, config)
+                            )
                             if new_total >= old_total - 0.01:
                                 continue
 
@@ -651,7 +677,7 @@ def calcola_slot_disponibili(
         return []
 
     consegne_esistenti = estrai_tutte_consegne(fattorini)
-    costo_attuale = costo_totale(fattorini)
+    costo_attuale = costo_totale(fattorini, pizzeria, config)
     risultati: list[SlotDisponibileGlobale] = []
 
     for slot in slot_list:
@@ -677,7 +703,7 @@ def calcola_slot_disponibili(
         if ids_assegnati != ids_richiesti:
             continue
 
-        costo = costo_totale(nuovi_fattorini) - costo_attuale
+        costo = costo_totale(nuovi_fattorini, pizzeria, config) - costo_attuale
         risultati.append(
             SlotDisponibileGlobale(
                 slot=slot,
