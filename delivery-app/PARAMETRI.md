@@ -87,11 +87,17 @@ Controlla quanto un giro può deviare geometricamente dalla linea pizzeria → c
 
 **Meccanismo** (in `isTripValid`): per ogni consegna non-farthest nel giro, calcola la deviazione triangolare:
 ```
-deviazioneReale = dist(pizzeria, d) + dist(d, farthest) - dist(pizzeria, farthest)
+deviazioneReale [km] = dist(pizzeria, d) + dist(d, farthest) - dist(pizzeria, farthest)
 ```
 Se `deviazioneReale > spatialElasticity / maxDist` il giro è rifiutato.
+
+Tutte le distanze sono in **km** (da `haversineKm`). Per rendere il confronto dimensionalmente consistente — `km > X / km` — il parametro `spatialElasticity` ha unità di **km²**, anche se di fatto è un numero di tuning empirico.
+
+Esempio concreto con `spatialElasticity = 6.0`:
+- consegna farthest a 2 km → soglia = 6/2 = **3 km** di deviazione permessa
+- consegna farthest a 0.5 km → soglia = 6/0.5 = **12 km** di deviazione permessa
 
 **Effetto pratico**:
 - **Basso** (es. 1–2): solo consegne quasi nella stessa direzione possono stare nello stesso giro. Giri molto diretti.
 - **Alto** (es. 10–20): anche consegne in direzioni diverse vengono raggruppate. Più efficiente in km ma geometricamente "storto".
-- Il denominatore `maxDist` fa sì che giri con consegne lontane siano più rigidi: la stessa deviazione angolare è più grave se la consegna più lontana è a 5 km rispetto a 0.5 km.
+- Il denominatore `maxDist` fa sì che giri con consegne lontane siano più rigidi: la stessa deviazione assoluta è più grave se la consegna più lontana è a 5 km rispetto a 0.5 km.

@@ -420,11 +420,46 @@ function calcAvailableSlots(slots, newCoord, numPizzas, orderId, riders, pizzeri
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// TRAINING MODE HELPERS
+// ═══════════════════════════════════════════════════════════════════
+
+function generateTrainingScenario(n, pizzeria) {
+  const slotGrid = [];
+  for (let t = 18 * 60; t <= 21 * 60; t += 15) slotGrid.push(t);
+  const deliveries = [];
+  for (let i = 0; i < n; i++) {
+    deliveries.push({
+      id: `train-${i}`,
+      lat: pizzeria.lat + (Math.random() - 0.5) * 0.045,
+      lng: pizzeria.lng + (Math.random() - 0.5) * 0.06,
+      numPizzas: Math.ceil(Math.random() * 4),
+      slot: slotGrid[Math.floor(Math.random() * slotGrid.length)],
+    });
+  }
+  return deliveries;
+}
+
+function metricColor(value, greenMax, yellowMax) {
+  if (value <= greenMax) return "#22c55e";
+  if (value <= yellowMax) return "#f59e0b";
+  return "#ef4444";
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // CONSTANTS & HELPERS
 // ═══════════════════════════════════════════════════════════════════
 
 const RIDER_COLORS = ["#ef4444", "#3b82f6", "#22c55e", "#f59e0b", "#a855f7", "#ec4899"];
 const PIZZERIA_DEFAULT = { lat: 45.428978, lng: 12.077287 };
+
+const PHASE2_PARAMS = [
+  ["Penalità nuovo giro",   "newTripPenalty",       1.0, 3.0,  0.1],
+  ["Max cons./giro",        "maxDeliveriesPerTrip", 1,   10,   1  ],
+  ["Tolleranza distanza",   "distToleranceFactor",  0,   3.0,  0.1],
+  ["Durata slot (min)",     "slotDurationMin",      5,   30,   5  ],
+  ["Peso deviazione",       "deviationWeight",      0,   5.0,  0.1],
+  ["Elasticità spaziale",   "spatialElasticity",    0.5, 30.0, 0.5],
+];
 
 const DEFAULT_CFG = {
   numRiders: 2, pizzeCapacity: 12, tMaxMin: 30, earlyToleranceMin: 10, lateToleranceMin: 10,
@@ -481,6 +516,24 @@ export default function App() {
   const [showConfig, setShowConfig] = useState(false);
   const [mode, setMode] = useState("view"); // view | placing | selecting
 
+  // ── Training Mode State ──
+  const [trainingMode, setTrainingMode] = useState(false);
+  const [trainingN, setTrainingN] = useState(8);
+  const [trainingDeliveries, setTrainingDeliveries] = useState([]);
+  const [trainingRiders, setTrainingRiders] = useState([]);
+  const [trainingCfg, setTrainingCfg] = useState({
+    newTripPenalty: DEFAULT_CFG.newTripPenalty,
+    maxDeliveriesPerTrip: DEFAULT_CFG.maxDeliveriesPerTrip,
+    distToleranceFactor: DEFAULT_CFG.distToleranceFactor,
+    slotDurationMin: DEFAULT_CFG.slotDurationMin,
+    deviationWeight: DEFAULT_CFG.deviationWeight,
+    spatialElasticity: DEFAULT_CFG.spatialElasticity,
+  });
+  const trainingRecomputeTimer = useRef(null);
+  const [trainingPlacing, setTrainingPlacing] = useState(false);
+  const [trainingNewPizzas, setTrainingNewPizzas] = useState(2);
+  const [trainingNewSlot, setTrainingNewSlot] = useState(18 * 60);
+
   const mapRef = useRef(null);
   const mapInst = useRef(null);
   const layersRef = useRef({ markers: null, routes: null, preview: null, newMarker: null, pizzeriaMarker: null });
@@ -534,11 +587,23 @@ export default function App() {
   // ── Map click handler ──
   useEffect(() => {
     window._mapClick = (latlng) => {
-      if (mode !== "placing") return;
-      setNewOrderPos({ lat: latlng.lat, lng: latlng.lng });
+      if (trainingMode && trainingPlacing) {
+        setTrainingDeliveries((prev) => [
+          ...prev,
+          {
+            id: `train-m-${Date.now()}`,
+            lat: latlng.lat,
+            lng: latlng.lng,
+            numPizzas: trainingNewPizzas,
+            slot: trainingNewSlot,
+          },
+        ]);
+      } else if (mode === "placing") {
+        setNewOrderPos({ lat: latlng.lat, lng: latlng.lng });
+      }
     };
     return () => { window._mapClick = null; };
-  }, [mode]);
+  }, [mode, trainingMode, trainingPlacing, trainingNewPizzas, trainingNewSlot]);
 
   // ── Draw new order marker ──
   useEffect(() => {
@@ -557,6 +622,7 @@ export default function App() {
 
   // ── Draw riders trips on map ──
   const drawMap = useCallback(() => {
+    if (trainingMode) return;
     if (!mapReady || !mapInst.current) return;
     const L = window.L;
     const { markers, routes, preview } = layersRef.current;
@@ -626,9 +692,94 @@ export default function App() {
         });
       });
     }
-  }, [riders, pizzeria, selectedTripKey, previewSlot, mapReady]);
+  }, [riders, pizzeria, selectedTripKey, previewSlot, mapReady, trainingMode]);
+
+  // ── Draw training map ──
+  const drawTrainingMap = useCallback((tRiders) => {
+    if (!mapReady || !mapInst.current) return;
+    const L = window.L;
+    const { markers, routes, preview } = layersRef.current;
+    markers.clearLayers();
+    routes.clearLayers();
+    preview.clearLayers();
+    tRiders.forEach((rider, ri) => {
+      const color = RIDER_COLORS[ri % RIDER_COLORS.length];
+      rider.trips.forEach((trip) => {
+        const points = [
+          [pizzeria.lat, pizzeria.lng],
+          ...trip.deliveries.map((d) => [d.lat, d.lng]),
+          [pizzeria.lat, pizzeria.lng],
+        ];
+        L.polyline(points, { color, weight: 3, opacity: 0.85 }).addTo(routes);
+        trip.deliveries.forEach((d, di) => {
+          const arrTime = trip.arrivalTimes ? trip.arrivalTimes[di] : d.slot;
+          const devMin = Math.abs(arrTime - d.slot);
+          const devColor = metricColor(devMin, 3, 8);
+          const icon = L.divIcon({
+            html: `<div style="background:${color};border:2px solid #fff;border-radius:50%;width:26px;height:26px;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;color:#fff;box-shadow:0 0 0 3px ${devColor},0 2px 8px rgba(0,0,0,.4);">${di + 1}</div>`,
+            iconSize: [26, 26], iconAnchor: [13, 13], className: "",
+          });
+          L.marker([d.lat, d.lng], { icon })
+            .bindTooltip(
+              `${d.id} · ${d.numPizzas}🍕 · slot ${timeStr(d.slot)} · arr ${timeStr(arrTime)} · dev ${devMin.toFixed(1)}min`,
+              { direction: "top", offset: [0, -16] }
+            )
+            .addTo(markers);
+        });
+      });
+    });
+  }, [mapReady, pizzeria]);
+
+  // ── Training: optimization callbacks (must be before useEffects that reference them) ──
+  const runTrainingOptimization = useCallback((deliveries, tCfg) => {
+    const fullCfg = { ...cfg, ...tCfg, availabilityConstraint: false };
+    const newRiders = rebuildAllRoutes(deliveries, cfg.numRiders, pizzeria, fullCfg);
+    twoOptAll(newRiders, pizzeria, fullCfg);
+    orOpt(newRiders, pizzeria, fullCfg);
+    setTrainingRiders(newRiders);
+  }, [cfg, pizzeria]);
+
+  const generateNewScenario = useCallback(() => {
+    setTrainingPlacing(false);
+    const deliveries = generateTrainingScenario(trainingN, pizzeria);
+    const fullCfg = { ...cfg, ...trainingCfg, availabilityConstraint: false };
+    const newRiders = rebuildAllRoutes(deliveries, cfg.numRiders, pizzeria, fullCfg);
+    twoOptAll(newRiders, pizzeria, fullCfg);
+    orOpt(newRiders, pizzeria, fullCfg);
+    setTrainingDeliveries(deliveries);
+    setTrainingRiders(newRiders);
+  }, [trainingN, pizzeria, cfg, trainingCfg]);
+
+  const clearTrainingDeliveries = useCallback(() => {
+    setTrainingDeliveries([]);
+    setTrainingRiders([]);
+    setTrainingPlacing(false);
+  }, []);
 
   useEffect(() => { drawMap(); }, [drawMap]);
+
+  // ── Training: recompute on trainingCfg change (debounced 200ms) ──
+  useEffect(() => {
+    if (!trainingMode || !trainingDeliveries.length) return;
+    clearTimeout(trainingRecomputeTimer.current);
+    trainingRecomputeTimer.current = setTimeout(() => {
+      runTrainingOptimization(trainingDeliveries, trainingCfg);
+    }, 200);
+    return () => clearTimeout(trainingRecomputeTimer.current);
+  }, [trainingCfg, trainingMode, trainingDeliveries, runTrainingOptimization]);
+
+  // ── Training: redraw map on trainingRiders change ──
+  useEffect(() => {
+    if (!trainingMode) return;
+    drawTrainingMap(trainingRiders);
+  }, [trainingMode, trainingRiders, drawTrainingMap]);
+
+  // ── Training: enter/exit mode ──
+  useEffect(() => {
+    if (trainingMode && trainingDeliveries.length === 0) generateNewScenario();
+    if (!trainingMode) drawMap();
+    if (mapInst.current) setTimeout(() => mapInst.current.invalidateSize(), 150);
+  }, [trainingMode]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Actions ──
   const loadPreset = () => {
@@ -698,6 +849,59 @@ export default function App() {
     return { min: min - 10, max: max + 10 };
   }, [riders, slots]);
 
+  const trainingTimeRange = useMemo(() => {
+    let min = slots[0], max = slots[slots.length - 1];
+    trainingRiders.forEach((r) => r.trips.forEach((t) => {
+      if (t.departureTime < min) min = t.departureTime;
+      const ret = tripReturnTime(t);
+      if (ret > max) max = ret;
+    }));
+    return { min: min - 10, max: max + 10 };
+  }, [trainingRiders, slots]);
+
+  const trainingMetrics = useMemo(() => {
+    if (!trainingRiders.length && !trainingDeliveries.length) return null;
+    const fullCfg = { ...cfg, ...trainingCfg };
+    const cost = totalCost(trainingRiders, fullCfg);
+    let totalTrips = 0, assignedCount = 0;
+    const tripDetails = [];
+    const deviations = [];
+    for (let ri = 0; ri < trainingRiders.length; ri++) {
+      const rider = trainingRiders[ri];
+      for (let ti = 0; ti < rider.trips.length; ti++) {
+        const trip = rider.trips[ti];
+        totalTrips++;
+        assignedCount += trip.deliveries.length;
+        if (trip.arrivalTimes) {
+          for (let di = 0; di < trip.deliveries.length; di++) {
+            deviations.push(Math.abs(trip.arrivalTimes[di] - trip.deliveries[di].slot));
+          }
+          tripDetails.push({
+            riderIdx: ri, tripIdx: ti,
+            deliveryCount: trip.deliveries.length,
+            departure: trip.departureTime,
+            returnT: tripReturnTime(trip),
+            avgDev: trip.deliveries.length ? tripDeviation(trip) / trip.deliveries.length : 0,
+          });
+        }
+      }
+    }
+    const avgDev = deviations.length ? deviations.reduce((a, b) => a + b, 0) / deviations.length : 0;
+    const maxDev = deviations.length ? Math.max(...deviations) : 0;
+    const usedRiders = trainingRiders.filter((r) => r.trips.length > 0).length;
+    return {
+      cost: Math.round(cost * 10) / 10,
+      totalTrips,
+      assignedCount,
+      totalDeliveries: trainingDeliveries.length,
+      avgDev,
+      maxDev,
+      usedRiders,
+      totalRiders: cfg.numRiders,
+      tripDetails,
+    };
+  }, [trainingRiders, trainingDeliveries, cfg, trainingCfg]);
+
   // ── Render ──
   return (
     <div style={{ height: "100vh", display: "flex", flexDirection: "column", background: "#0f172a", color: "#e2e8f0", fontFamily: "'JetBrains Mono', 'Fira Code', 'SF Mono', monospace", fontSize: 13 }}>
@@ -712,6 +916,9 @@ export default function App() {
         <button onClick={resetAll} style={btnStyle("#64748b")}>Reset</button>
         <button onClick={() => setShowConfig(!showConfig)} style={btnStyle("#475569")}>
           {showConfig ? "Chiudi config" : "⚙ Config"}
+        </button>
+        <button onClick={() => { setTrainingMode((m) => !m); setTrainingPlacing(false); }} style={btnStyle(trainingMode ? "#f59e0b" : "#7c3aed")}>
+          {trainingMode ? "← Esci allenamento" : "🎯 Allenamento"}
         </button>
       </div>
 
@@ -763,14 +970,61 @@ export default function App() {
       {/* ── MAIN AREA ── */}
       <div style={{ flex: 1, display: "flex", minHeight: 0 }}>
 
-        {/* ── MAP ── */}
+        {/* ── TRAINING: LEFT PARAMS PANEL ── */}
+        {trainingMode && (
+          <div style={{ width: 230, background: "#1e293b", borderRight: "1px solid #334155", overflowY: "auto", flexShrink: 0, padding: "12px 10px" }}>
+            <div style={{ fontSize: 11, fontWeight: 700, color: "#94a3b8", letterSpacing: 1, textTransform: "uppercase", marginBottom: 14 }}>
+              Parametri Phase 2
+            </div>
+            {PHASE2_PARAMS.map(([label, key, min, max, step]) => (
+              <div key={key} style={{ marginBottom: 16 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+                  <span style={{ fontSize: 11, color: "#94a3b8" }}>{label}</span>
+                  <input
+                    type="number" value={trainingCfg[key]} min={min} max={max} step={step}
+                    onChange={(e) => setTrainingCfg((c) => ({ ...c, [key]: parseFloat(e.target.value) || 0 }))}
+                    style={{ width: 52, background: "#0f172a", border: "1px solid #475569", borderRadius: 4, padding: "2px 5px", color: "#e2e8f0", fontSize: 11, textAlign: "right" }}
+                  />
+                </div>
+                <input
+                  type="range" className="training-slider"
+                  value={trainingCfg[key]} min={min} max={max} step={step}
+                  onChange={(e) => setTrainingCfg((c) => ({ ...c, [key]: parseFloat(e.target.value) }))}
+                />
+              </div>
+            ))}
+            <details style={{ marginTop: 16 }}>
+              <summary style={{ fontSize: 11, color: "#64748b", cursor: "pointer", marginBottom: 8, userSelect: "none" }}>
+                Parametri fissi (Phase 1)
+              </summary>
+              {[
+                ["Fattorini", "numRiders"], ["Capac. pizze", "pizzeCapacity"],
+                ["T max (min)", "tMaxMin"], ["Early tol.", "earlyToleranceMin"],
+                ["Late tol.", "lateToleranceMin"], ["Detour factor", "detourFactor"],
+                ["Velocità km/h", "avgSpeedKmh"], ["Sosta (min)", "stopTimeMin"],
+              ].map(([label, key]) => (
+                <div key={key} style={{ display: "flex", justifyContent: "space-between", fontSize: 11, color: "#64748b", padding: "2px 0" }}>
+                  <span>{label}</span>
+                  <span style={{ color: "#94a3b8" }}>{cfg[key]}</span>
+                </div>
+              ))}
+            </details>
+          </div>
+        )}
+
+        {/* ── MAP (always mounted to preserve Leaflet instance) ── */}
         <div style={{ flex: 1, position: "relative", minHeight: 0 }}>
           <div ref={mapRef} style={{ width: "100%", height: "100%" }} />
 
           {/* Placing mode overlay */}
-          {mode === "placing" && (
+          {mode === "placing" && !trainingMode && (
             <div style={{ position: "absolute", top: 12, left: "50%", transform: "translateX(-50%)", zIndex: 1000, background: "#fbbf24", color: "#0f172a", padding: "8px 20px", borderRadius: 8, fontWeight: 700, fontSize: 13, boxShadow: "0 4px 20px rgba(251,191,36,.4)" }}>
               📍 Clicca sulla mappa per posizionare la consegna
+            </div>
+          )}
+          {trainingMode && trainingPlacing && (
+            <div style={{ position: "absolute", top: 12, left: "50%", transform: "translateX(-50%)", zIndex: 1000, background: "#6366f1", color: "#fff", padding: "8px 20px", borderRadius: 8, fontWeight: 700, fontSize: 13, boxShadow: "0 4px 20px rgba(99,102,241,.5)" }}>
+              📍 Clicca sulla mappa per aggiungere una consegna
             </div>
           )}
 
@@ -781,8 +1035,26 @@ export default function App() {
           )}
         </div>
 
-        {/* ── SIDE PANEL ── */}
-        <div style={{ width: 320, background: "#1e293b", borderLeft: "1px solid #334155", display: "flex", flexDirection: "column", overflowY: "auto", flexShrink: 0 }}>
+        {/* ── TRAINING: RIGHT METRICS PANEL ── */}
+        {trainingMode && (
+          <TrainingMetricsPanel
+            metrics={trainingMetrics}
+            trainingN={trainingN}
+            setTrainingN={setTrainingN}
+            onNewScenario={generateNewScenario}
+            onClearDeliveries={clearTrainingDeliveries}
+            trainingPlacing={trainingPlacing}
+            setTrainingPlacing={setTrainingPlacing}
+            trainingNewPizzas={trainingNewPizzas}
+            setTrainingNewPizzas={setTrainingNewPizzas}
+            trainingNewSlot={trainingNewSlot}
+            setTrainingNewSlot={setTrainingNewSlot}
+            slots={slots}
+          />
+        )}
+
+        {/* ── SIDE PANEL (normal mode) ── */}
+        {!trainingMode && <div style={{ width: 320, background: "#1e293b", borderLeft: "1px solid #334155", display: "flex", flexDirection: "column", overflowY: "auto", flexShrink: 0 }}>
 
           {mode === "view" && !availableSlots && (
             <div style={{ padding: 20 }}>
@@ -889,15 +1161,20 @@ export default function App() {
               )}
             </div>
           )}
-        </div>
+        </div>}
+
       </div>
 
       {/* ── TIMELINE (Gantt) ── */}
       <div style={{ height: 180, background: "#1e293b", borderTop: "1px solid #334155", flexShrink: 0, overflowX: "auto", overflowY: "hidden" }}>
         <Timeline
-          riders={riders} slots={slots} timeRange={timeRange}
-          selectedTripKey={selectedTripKey} setSelectedTripKey={setSelectedTripKey}
-          previewSlot={previewSlot} cfg={cfg}
+          riders={trainingMode ? trainingRiders : riders}
+          slots={slots}
+          timeRange={trainingMode ? trainingTimeRange : timeRange}
+          selectedTripKey={trainingMode ? null : selectedTripKey}
+          setSelectedTripKey={trainingMode ? () => {} : setSelectedTripKey}
+          previewSlot={trainingMode ? null : previewSlot}
+          cfg={trainingMode ? { ...cfg, ...trainingCfg } : cfg}
         />
       </div>
     </div>
@@ -1002,6 +1279,135 @@ function Timeline({ riders, slots, timeRange, selectedTripKey, setSelectedTripKe
           );
         })}
       </svg>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// TRAINING METRICS PANEL
+// ═══════════════════════════════════════════════════════════════════
+
+function TrainingMetricsPanel({
+  metrics, trainingN, setTrainingN, onNewScenario, onClearDeliveries,
+  trainingPlacing, setTrainingPlacing, trainingNewPizzas, setTrainingNewPizzas,
+  trainingNewSlot, setTrainingNewSlot, slots,
+}) {
+  const pct = metrics ? Math.round((metrics.assignedCount / Math.max(metrics.totalDeliveries, 1)) * 100) : 0;
+  return (
+    <div style={{ width: 280, background: "#1e293b", borderLeft: "1px solid #334155", overflowY: "auto", flexShrink: 0, display: "flex", flexDirection: "column" }}>
+
+      {/* Scenario casuale */}
+      <div style={{ padding: "12px 12px 10px", borderBottom: "1px solid #334155" }}>
+        <div style={{ fontSize: 11, fontWeight: 700, color: "#94a3b8", letterSpacing: 1, textTransform: "uppercase", marginBottom: 10 }}>
+          Scenario casuale
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+          <span style={{ fontSize: 11, color: "#94a3b8" }}>Consegne:</span>
+          <button onClick={() => setTrainingN((n) => Math.max(1, n - 1))} style={{ ...btnStyle("#334155"), padding: "2px 8px", fontSize: 13 }}>−</button>
+          <span style={{ fontSize: 13, fontWeight: 700, color: "#e2e8f0", minWidth: 20, textAlign: "center" }}>{trainingN}</span>
+          <button onClick={() => setTrainingN((n) => Math.min(20, n + 1))} style={{ ...btnStyle("#334155"), padding: "2px 8px", fontSize: 13 }}>+</button>
+        </div>
+        <button onClick={onNewScenario} style={{ ...btnStyle("#6366f1"), width: "100%", padding: "7px 0" }}>
+          🎲 Nuovo Scenario
+        </button>
+      </div>
+
+      {/* Aggiunta manuale */}
+      <div style={{ padding: "10px 12px", borderBottom: "1px solid #334155" }}>
+        <div style={{ fontSize: 11, fontWeight: 700, color: "#94a3b8", letterSpacing: 1, textTransform: "uppercase", marginBottom: 8 }}>
+          Aggiunta manuale
+        </div>
+        {trainingPlacing ? (
+          <>
+            <div style={{ fontSize: 11, color: "#6366f1", fontWeight: 700, marginBottom: 8 }}>
+              📍 Clicca sulla mappa...
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 6 }}>
+              <span style={{ fontSize: 11, color: "#94a3b8" }}>Pizze:</span>
+              <button onClick={() => setTrainingNewPizzas((n) => Math.max(1, n - 1))} style={{ ...btnStyle("#334155"), padding: "1px 7px", fontSize: 13 }}>−</button>
+              <span style={{ fontSize: 13, fontWeight: 700, color: "#e2e8f0", minWidth: 16, textAlign: "center" }}>{trainingNewPizzas}</span>
+              <button onClick={() => setTrainingNewPizzas((n) => Math.min(8, n + 1))} style={{ ...btnStyle("#334155"), padding: "1px 7px", fontSize: 13 }}>+</button>
+            </div>
+            <div style={{ marginBottom: 8 }}>
+              <select
+                value={trainingNewSlot}
+                onChange={(e) => setTrainingNewSlot(parseInt(e.target.value))}
+                style={{ width: "100%", background: "#0f172a", border: "1px solid #475569", borderRadius: 4, padding: "4px 6px", color: "#e2e8f0", fontSize: 11 }}
+              >
+                {slots.map((s) => <option key={s} value={s}>{timeStr(s)}</option>)}
+              </select>
+            </div>
+            <button onClick={() => setTrainingPlacing(false)} style={{ ...btnStyle("#475569"), width: "100%", padding: "5px 0" }}>
+              Annulla
+            </button>
+          </>
+        ) : (
+          <button onClick={() => setTrainingPlacing(true)} style={{ ...btnStyle("#0ea5e9"), width: "100%", padding: "7px 0" }}>
+            📍 Aggiungi consegna
+          </button>
+        )}
+        <button onClick={onClearDeliveries} style={{ ...btnStyle("#334155"), width: "100%", padding: "5px 0", marginTop: 6 }}>
+          🗑️ Svuota tutto
+        </button>
+      </div>
+
+      {/* Metrics */}
+      <div style={{ padding: "12px 12px 4px" }}>
+        <div style={{ fontSize: 11, fontWeight: 700, color: "#94a3b8", letterSpacing: 1, textTransform: "uppercase", marginBottom: 10 }}>
+          Metriche
+        </div>
+        {metrics ? (
+          <>
+            {[
+              ["Costo totale", metrics.cost.toFixed(1), metricColor(metrics.avgDev, 3, 8)],
+              ["Giri totali", metrics.totalTrips, null],
+              ["Consegne ass.", `${metrics.assignedCount} / ${metrics.totalDeliveries}`, metricColor(100 - pct, 0, 20)],
+              ["Rider in uso", `${metrics.usedRiders} / ${metrics.totalRiders}`, null],
+              ["Dev. media", `${metrics.avgDev.toFixed(1)} min`, metricColor(metrics.avgDev, 3, 8)],
+              ["Dev. massima", `${metrics.maxDev.toFixed(1)} min`, metricColor(metrics.maxDev, 6, 15)],
+            ].map(([label, value, color]) => (
+              <div key={label} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "4px 0", borderBottom: "1px solid #0f172a" }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                  {color && <div style={{ width: 7, height: 7, borderRadius: "50%", background: color, flexShrink: 0 }} />}
+                  {!color && <div style={{ width: 7, height: 7, flexShrink: 0 }} />}
+                  <span style={{ fontSize: 11, color: "#94a3b8" }}>{label}</span>
+                </div>
+                <span style={{ fontSize: 12, fontWeight: 700, color: color || "#e2e8f0" }}>{value}</span>
+              </div>
+            ))}
+          </>
+        ) : (
+          <div style={{ color: "#475569", fontSize: 11 }}>Nessun dato</div>
+        )}
+      </div>
+
+      {/* Trip detail */}
+      {metrics && metrics.tripDetails.length > 0 && (
+        <div style={{ padding: "10px 12px", flex: 1, overflowY: "auto" }}>
+          <div style={{ fontSize: 11, fontWeight: 700, color: "#94a3b8", letterSpacing: 1, textTransform: "uppercase", marginBottom: 8 }}>
+            Dettaglio giri
+          </div>
+          {metrics.tripDetails.map((td, i) => (
+            <div key={i} style={{
+              padding: "7px 8px", marginBottom: 5, borderRadius: 6,
+              background: "#0f172a", border: `1px solid ${RIDER_COLORS[td.riderIdx % RIDER_COLORS.length]}40`,
+            }}>
+              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 2 }}>
+                <span style={{ fontSize: 11, fontWeight: 700, color: RIDER_COLORS[td.riderIdx % RIDER_COLORS.length] }}>
+                  Rider {td.riderIdx + 1} · Giro {td.tripIdx + 1}
+                </span>
+                <span style={{ fontSize: 10, color: "#64748b" }}>{td.deliveryCount} cons.</span>
+              </div>
+              <div style={{ fontSize: 10, color: "#94a3b8" }}>
+                {timeStr(td.departure)} → {timeStr(td.returnT)}
+              </div>
+              <div style={{ fontSize: 10, color: metricColor(td.avgDev, 3, 8) }}>
+                dev media: {td.avgDev.toFixed(1)} min
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
